@@ -1,10 +1,12 @@
-﻿using System;
+using ZaibPetroleumService.Model;
+using ZaibPetroleumService.View;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-namespace PetrolPump
+namespace ZaibPetroleumService
 {
     internal static class Program
     {
@@ -16,7 +18,9 @@ namespace PetrolPump
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new SampleView());
+            // Silent cloud sync (zaibservice) — UI unchanged
+            try { Services.SupabaseSyncService.StartSilent(); } catch { }
+            Application.Run(new LoginForm());
         }
     }
 }

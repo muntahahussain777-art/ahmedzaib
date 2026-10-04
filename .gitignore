@@ -361,3 +361,15 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Local databases & secrets (do not upload)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+**/gemini_keys.txt
+**/groq_keys.txt
+**/*keys*.txt
+.env
+.env.*
+**/DiselPetrolPump/
