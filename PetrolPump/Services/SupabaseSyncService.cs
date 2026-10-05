@@ -34,16 +34,20 @@ namespace ZaibPetroleumService.Services
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private const string DefaultPull = "1970-01-01T00:00:00.000Z";
         private const int PageSize = 500;
-        /// <summary>Local SQLite checkpoint key for zaib_sync_changes change_id cursor (BIGINT).</summary>
-        private const string ChangeFeedCheckpointKey = "__change_feed__";
-        private const string ChangeFeedCloudTable = "zaib_sync_changes";
+        /// <summary>Protocol v2 checkpoint for zaib_sync_feed.rev (transactional publication counter).</summary>
+        private const string ChangeFeedCheckpointKey = "__change_feed_v2__";
+        private const string ChangeFeedLegacyCheckpointKey = "__change_feed__";
+        private const string ChangeFeedCloudTable = "zaib_sync_feed";
 
         /// <summary>
-        /// Change feed uses monotonic change_id (BIGSERIAL). Advancing the cursor to MAX(id) alone is
-        /// unsafe under concurrent writers or out-of-order delivery — clients must advance only through
-        /// contiguous change_id values (expected next id = cursor + 1).
+        /// Part 6: revisions come from a locked zaib_sync_pub counter in the same transaction as the
+        /// business write + feed insert. Rollback undoes the counter bump; concurrent writers serialize.
+        /// Do not bootstrap with MAX(id). Legacy __change_feed__ / MAX cursors are repaired by replaying
+        /// from rev 0 (LWW + SyncBalanceApplied keep financials idempotent).
         /// </summary>
         private enum RemoteApplyGate { Apply, SkipDone, SkipStage }
+        private static long _pullBackoffUntilUtcTicks;
+        private static int _noProgressBackoffMs;
 
         private static HttpClient CreateClient()
         {
@@ -470,14 +474,26 @@ END;";
 
                     await EnsureChangeFeedBootstrappedAsync(con);
 
-                    // Change feed pull: discovery only — row LWW/updated_at remains conflict authority.
+                    if (DateTime.UtcNow.Ticks < _pullBackoffUntilUtcTicks)
+                    {
+                        LogFail(con, "pull:backoff", null, new Exception("skip pass (no-progress backoff)"));
+                    }
+                    else
+                    {
+                    // Change feed pull: discovery only — row LWW/updated_at/server_rev remains conflict authority.
                     long changeCursor = GetChangeFeedCursor(con);
                     while (true)
                     {
                         var page = await FetchChangeFeedPageAsync(changeCursor);
-                        if (page.Count == 0) break;
+                        if (page.Count == 0)
+                        {
+                            _noProgressBackoffMs = 0;
+                            _pullBackoffUntilUtcTicks = 0;
+                            break;
+                        }
 
                         long advancedTo = changeCursor;
+                        long cursorBefore = changeCursor;
                         using (var tx = con.BeginTransaction())
                         {
                             try
@@ -485,13 +501,13 @@ END;";
                                 BeginRemoteApply(con);
                                 foreach (var change in page)
                                 {
-                                    long changeId = change.Value<long?>("change_id") ?? 0;
-                                    if (changeId <= 0) continue;
-                                    if (changeId != advancedTo + 1)
+                                    long rev = change.Value<long?>("rev") ?? 0;
+                                    if (rev <= 0) continue;
+                                    if (rev != advancedTo + 1)
                                         break;
                                     if (!ApplySyncChangeRow(con, change))
                                         break;
-                                    advancedTo = changeId;
+                                    advancedTo = rev;
                                 }
                                 FlushStaged(con);
                                 EndRemoteApply(con);
@@ -509,11 +525,23 @@ END;";
                         {
                             SetChangeFeedCursor(con, advancedTo);
                             changeCursor = advancedTo;
+                            _noProgressBackoffMs = 0;
+                            _pullBackoffUntilUtcTicks = 0;
                         }
                         else
+                        {
+                            // Full/partial page with no watermark progress — stop this pass; retry later with backoff.
+                            _noProgressBackoffMs = _noProgressBackoffMs <= 0
+                                ? 2000
+                                : Math.Min(_noProgressBackoffMs * 2, 60000);
+                            _pullBackoffUntilUtcTicks = DateTime.UtcNow.AddMilliseconds(_noProgressBackoffMs).Ticks;
+                            LogFail(con, "pull:no_progress", null,
+                                new Exception("cursor=" + cursorBefore + " page=" + page.Count + " backoffMs=" + _noProgressBackoffMs));
                             break;
+                        }
 
                         if (page.Count < PageSize) break;
+                    }
                     }
                 }
             }
@@ -850,28 +878,31 @@ END;";
         private static async Task EnsureChangeFeedBootstrappedAsync(SQLiteConnection con)
         {
             if (HasChangeFeedCheckpoint(con)) return;
-            long cursor = 0;
-            if (LocalHasSyncedBusinessRows(con) || HasLegacyPerTablePullCheckpoints())
-                cursor = await FetchMaxChangeFeedIdAsync();
-            SetChangeFeedCursor(con, cursor);
+
+            // Protocol v2: never MAX-skip. Replay from rev 0 (resumable via cursor advances).
+            // Legacy __change_feed__ MAX bootstrap is intentionally ignored so missed history is repaired.
+            if (HasLegacyChangeFeedCheckpoint(con))
+                LogFail(con, "pull:bootstrap_repair", null, new Exception("legacy MAX cursor → chg_v2:0"));
+
+            SetChangeFeedCursor(con, 0);
+            await Task.CompletedTask;
         }
 
-        private static async Task<long> FetchMaxChangeFeedIdAsync()
+        private static bool HasLegacyChangeFeedCheckpoint(SQLiteConnection con)
         {
-            string url = $"{Url}/rest/v1/{ChangeFeedCloudTable}?select=change_id&order=change_id.desc&limit=1";
-            var res = await Http.GetAsync(url);
-            res.EnsureSuccessStatusCode();
-            string body = await res.Content.ReadAsStringAsync();
-            var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
-            if (arr.Count == 0 || !(arr[0] is JObject jo)) return 0;
-            return jo.Value<long?>("change_id") ?? 0;
+            using (var cmd = new SQLiteCommand(
+                "SELECT 1 FROM SyncCheckpoint WHERE CloudTable=@t LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@t", ChangeFeedLegacyCheckpointKey);
+                return cmd.ExecuteScalar() != null;
+            }
         }
 
         private static async Task<List<JObject>> FetchChangeFeedPageAsync(long cursor)
         {
             string url =
-                $"{Url}/rest/v1/{ChangeFeedCloudTable}?change_id=gt.{cursor}" +
-                $"&order=change_id.asc&limit={PageSize}";
+                $"{Url}/rest/v1/{ChangeFeedCloudTable}?rev=gt.{cursor}" +
+                $"&order=rev.asc&limit={PageSize}";
             var res = await Http.GetAsync(url);
             res.EnsureSuccessStatusCode();
             string body = await res.Content.ReadAsStringAsync();
@@ -900,7 +931,7 @@ END;";
                 throw new InvalidOperationException($"Sync apply failed ({scope}) syncId={syncId ?? ""}");
         }
 
-        /// <summary>Apply one zaib_sync_changes row. False stalls contiguous change_id watermark.</summary>
+        /// <summary>Apply one zaib_sync_feed row. False stalls contiguous rev watermark.</summary>
         private static bool ApplySyncChangeRow(SQLiteConnection con, JObject change)
         {
             string cloudTable = change.Value<string>("cloud_table");
@@ -1312,7 +1343,7 @@ END;";
                 StageRemote(con, "zaib_dealer_transfers", r);
                 return false;
             }
-            double amount = r.Value<double?>("amount") ?? 0;
+            double amount = r.Value<double?>("amount") ?? r.Value<double?>("amount_given") ?? 0;
             string dateText = r.Value<string>("date_text") ?? "";
             string note = r.Value<string>("note") ?? "";
             string firstName = "";

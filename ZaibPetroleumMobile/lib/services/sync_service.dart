@@ -20,9 +20,9 @@ class SyncService {
   SyncService._();
   static final SyncService instance = SyncService._();
 
-  static const _prefsLastPullPrefix = 'zaib_sync_last_pull_';
   static const _prefsChangeCursor = 'zaib_sync_change_cursor';
   static const _prefsDeviceId = 'zaib_sync_device_id';
+  static const _prefsPullBackoffUntil = 'zaib_sync_pull_backoff_until_ms';
 
   bool _running = false;
   bool _initialized = false;
@@ -30,9 +30,11 @@ class SyncService {
   StreamSubscription<List<ConnectivityResult>>? _connSub;
   Timer? _periodic;
   Timer? _dirtyDebounce;
+  int _noProgressBackoffMs = 0;
 
   static const _httpTimeout = Duration(seconds: 12);
   static const _pageSize = 500;
+  static const _maxNoProgressBackoffMs = 60000;
 
   SupabaseClient get _client => Supabase.instance.client;
 
@@ -989,75 +991,50 @@ class SyncService {
   Future<int> _loadChangeCursor() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_prefsChangeCursor);
-    if (raw == null) {
-      return _bootstrapChangeCursor(prefs);
+    if (raw == null || raw.isEmpty) {
+      // Brand-new device: start at 0 and replay authoritative feed (no MAX skip).
+      await _saveChangeCursor(0);
+      return 0;
     }
     final decoded = SyncPolicy.decodeChangeCursor(raw);
     if (decoded == -1) {
-      return _bootstrapChangeCursor(prefs);
+      // Legacy chg:/timestamp/MAX-bootstrap: repair by replaying feed from 0.
+      // LWW + SyncBalanceApplied keep financial effects idempotent.
+      await _logFail('pull:bootstrap_repair', null, 'legacy cursor → chg_v2:0');
+      await _saveChangeCursor(0);
+      return 0;
     }
     return decoded;
   }
 
-  Future<void> _saveChangeCursor(int changeId) async {
+  Future<void> _saveChangeCursor(int rev) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefsChangeCursor, SyncPolicy.encodeChangeCursor(changeId));
+    await prefs.setString(_prefsChangeCursor, SyncPolicy.encodeChangeCursor(rev));
   }
 
-  Future<bool> _anyLegacyPullPrefs(SharedPreferences prefs) async =>
-      prefs.getKeys().any((k) => k.startsWith(_prefsLastPullPrefix));
-
-  Future<bool> _anyLocalSyncedBusinessRow(Database db) async {
-    const tables = [
-      'AddCustomer',
-      'PetrolAdd',
-      'AddDealer',
-      'DieselLedgerCredit',
-      'AddStock',
-      'DieselLedgerDebit',
-      'StockDiesel',
-      'BankTransactions',
-      'Expensetable',
-      'DealertoDealer',
-    ];
-    for (final t in tables) {
-      final rows = await db.rawQuery(
-        'SELECT 1 FROM $t WHERE SyncId IS NOT NULL AND trim(SyncId) <> \'\' LIMIT 1',
-      );
-      if (rows.isNotEmpty) return true;
-    }
-    return false;
+  Future<bool> _pullBackoffActive() async {
+    final prefs = await SharedPreferences.getInstance();
+    final until = prefs.getInt(_prefsPullBackoffUntil) ?? 0;
+    return DateTime.now().millisecondsSinceEpoch < until;
   }
 
-  Future<int> _bootstrapChangeCursor(SharedPreferences prefs) async {
-    final db = await AppDatabase.instance.database;
-    final skipHistory =
-        await _anyLocalSyncedBusinessRow(db) || await _anyLegacyPullPrefs(prefs);
-    if (skipHistory) {
-      try {
-        final raw = await _table('zaib_sync_changes')
-            .select('change_id')
-            .order('change_id', ascending: false)
-            .limit(1)
-            .timeout(_httpTimeout);
-        if (raw.isNotEmpty) {
-          final maxId = _asInt(raw.first['change_id']);
-          await _saveChangeCursor(maxId);
-          return maxId;
-        }
-      } catch (e) {
-        await _logFail('pull:bootstrap', null, e);
-      }
-    }
-    await _saveChangeCursor(0);
-    return 0;
+  Future<void> _setPullBackoff(int ms) async {
+    final prefs = await SharedPreferences.getInstance();
+    final until = DateTime.now().millisecondsSinceEpoch + ms;
+    await prefs.setInt(_prefsPullBackoffUntil, until);
+  }
+
+  Future<void> _clearPullBackoff() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_prefsPullBackoffUntil);
+    _noProgressBackoffMs = 0;
   }
 
   Future<List<Map<String, dynamic>>> _fetchChangePage(int cursor) async {
-    final raw = await _table('zaib_sync_changes')
+    final raw = await _table('zaib_sync_feed')
         .select()
-        .gt('change_id', cursor)
-        .order('change_id', ascending: true)
+        .gt('rev', cursor)
+        .order('rev', ascending: true)
         .limit(_pageSize)
         .timeout(_httpTimeout);
     return raw.map((row) => Map<String, dynamic>.from(row as Map)).toList();
@@ -1119,8 +1096,14 @@ class SyncService {
     }
   }
 
-  /// Change-feed pull (discovery only). Returns true if any row was [RemoteApplyResult.applied].
+  /// Change-feed pull against zaib_sync_feed.rev (protocol v2).
+  /// Returns true if any row was [RemoteApplyResult.applied].
   Future<bool> _pullChangeFeed() async {
+    if (await _pullBackoffActive()) {
+      await _logFail('pull:backoff', null, 'skip pass (no-progress backoff)');
+      return false;
+    }
+
     final db = await AppDatabase.instance.database;
     var cursor = await _loadChangeCursor();
     var anyApplied = false;
@@ -1133,13 +1116,17 @@ class SyncService {
         await _logFail('pull:change_feed', null, e);
         break;
       }
-      if (page.isEmpty) break;
+      if (page.isEmpty) {
+        await _clearPullBackoff();
+        break;
+      }
 
       final successfulIds = <int>[];
+      final cursorBefore = cursor;
 
       for (final changeRow in page) {
-        final changeId = _asInt(changeRow['change_id']);
-        if (changeId <= 0) continue;
+        final rev = _asInt(changeRow['rev']);
+        if (rev <= 0) continue;
         final cloudTable = changeRow['cloud_table']?.toString() ?? '';
         final rowSyncId = changeRow['row_sync_id']?.toString() ?? '';
         final payload = _payloadFromChangeRow(changeRow);
@@ -1150,11 +1137,12 @@ class SyncService {
             (txn) => _applyChangePayload(txn, cloudTable, payload),
           );
         } catch (e) {
+          // Do not advance past an unhandled failure; retain staging from prior successes.
           await _logFail('pull:apply:$cloudTable', rowSyncId, e);
-          continue;
+          break;
         }
 
-        successfulIds.add(changeId);
+        successfulIds.add(rev);
         if (result == RemoteApplyResult.applied) anyApplied = true;
       }
 
@@ -1165,6 +1153,25 @@ class SyncService {
       if (newCursor > cursor) {
         cursor = newCursor;
         await _saveChangeCursor(cursor);
+        await _clearPullBackoff();
+      }
+
+      if (SyncPolicy.changeFeedNoProgress(
+        cursorBefore: cursorBefore,
+        cursorAfter: newCursor,
+        rawPageLength: page.length,
+        pageSize: _pageSize,
+      )) {
+        _noProgressBackoffMs = _noProgressBackoffMs == 0
+            ? 2000
+            : (_noProgressBackoffMs * 2).clamp(2000, _maxNoProgressBackoffMs);
+        await _setPullBackoff(_noProgressBackoffMs);
+        await _logFail(
+          'pull:no_progress',
+          null,
+          'cursor=$cursorBefore page=${page.length} backoff=${_noProgressBackoffMs}ms',
+        );
+        break;
       }
 
       if (!SyncPolicy.serverPageHasMore(rawPageLength: page.length, pageSize: _pageSize)) {
@@ -1712,6 +1719,8 @@ class SyncService {
     );
     if (gate != null) return gate;
     if (deleted) {
+      await DealerBalanceApply.reverse(db: db, sourceSyncId: '$syncId:from', markDealerDirty: false);
+      await DealerBalanceApply.reverse(db: db, sourceSyncId: '$syncId:to', markDealerDirty: false);
       await _applyRemoteDelete(db, 'DealertoDealer', syncId);
       return RemoteApplyResult.applied;
     }
@@ -1724,7 +1733,8 @@ class SyncService {
       await _stageRemote(db, 'zaib_dealer_transfers', r);
       return RemoteApplyResult.stagedForRetry;
     }
-    final amount = _asDouble(r['amount_given']);
+    // Cloud column is `amount` (legacy clients may still send amount_given).
+    final amount = _asDouble(r['amount'] ?? r['amount_given']);
     await _upsertLocal(db, 'DealertoDealer', syncId, {
       'Date': _asStr(r['date_text']),
       'FirstDealer': fromDid,
@@ -1771,7 +1781,7 @@ class SyncService {
           'local_id': r['LedgerID'],
           'from_dealer_sync_id': fromSync,
           'to_dealer_sync_id': toSync,
-          'amount_given': r['AmounGiven'] ?? 0,
+          'amount': r['AmounGiven'] ?? 0,
           'date_text': r['Date'] ?? '',
           'note': r['Note'] ?? '',
           'updated_at': updatedAt,

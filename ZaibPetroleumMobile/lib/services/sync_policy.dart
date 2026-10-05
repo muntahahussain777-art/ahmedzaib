@@ -187,9 +187,10 @@ class SyncPolicy {
     return (cursor.substring(0, i), cursor.substring(i + 1));
   }
 
-  /// Contiguous watermark for BIGSERIAL change feeds.
-  /// Concurrent transactions may commit out of ID order; only advance through
-  /// contiguous IDs so a late commit with a lower ID is not skipped forever.
+  /// Contiguous watermark for a gapless transactional publication counter.
+  /// Under Part 6, revisions are allocated via a locked counter in the same
+  /// transaction as the feed row — permanent IDENTITY gaps do not occur.
+  /// Contiguous advance remains a defensive stall if a page is incomplete.
   static int advanceContiguousWatermark({
     required int cursor,
     required Iterable<int> seenIds,
@@ -206,15 +207,34 @@ class SyncPolicy {
     return next;
   }
 
-  static String encodeChangeCursor(int changeId) => 'chg:$changeId';
+  /// Protocol v2 cursor for zaib_sync_feed.rev (transactional publication).
+  static const int changeFeedProtocolVersion = 2;
 
+  static String encodeChangeCursor(int rev, {int protocol = changeFeedProtocolVersion}) {
+    if (protocol >= 2) return 'chg_v2:$rev';
+    return 'chg:$rev';
+  }
+
+  /// Decoded publication cursor. [-1] means "needs v2 repair bootstrap"
+  /// (legacy timestamp, legacy chg: MAX-bootstrap, or unknown).
   static int decodeChangeCursor(String? raw) {
     if (raw == null || raw.isEmpty) return 0;
-    if (raw.startsWith('chg:')) {
-      return int.tryParse(raw.substring(4)) ?? 0;
+    if (raw.startsWith('chg_v2:')) {
+      return int.tryParse(raw.substring(7)) ?? 0;
     }
-    // Legacy timestamp cursor — treated as "needs bootstrap", not a change id.
+    // Legacy v1 MAX-bootstrapped or timestamp cursors must re-reconcile from 0.
     return -1;
+  }
+
+  /// True when a full server page produced no watermark progress (stop pass).
+  static bool changeFeedNoProgress({
+    required int cursorBefore,
+    required int cursorAfter,
+    required int rawPageLength,
+    required int pageSize,
+  }) {
+    if (cursorAfter > cursorBefore) return false;
+    return rawPageLength >= pageSize || rawPageLength > 0;
   }
 
   /// Whether composite pull cursor (updatedAt, syncId) is at or before (at2, id2).

@@ -4,9 +4,16 @@ import 'package:sqflite/sqflite.dart';
 class SyncLocalUpsert {
   SyncLocalUpsert._();
 
+  /// Genuine UNIQUE / PRIMARY KEY conflicts only — not every SQLite "constraint" error
+  /// (CHECK/NOT NULL/FOREIGN KEY must still throw and roll back).
   static bool isUniqueConflict(DatabaseException e) {
     final m = e.toString().toLowerCase();
-    return m.contains('unique') || m.contains('constraint') || m.contains('2067');
+    if (m.contains('2067')) return true; // SQLITE_CONSTRAINT_UNIQUE
+    if (m.contains('1555')) return true; // SQLITE_CONSTRAINT_PRIMARYKEY
+    if (m.contains('unique constraint')) return true;
+    if (m.contains('primary key')) return true;
+    if (m.contains('unique') && m.contains('constraint')) return true;
+    return false;
   }
 
   static Future<void> upsertBySyncId(
