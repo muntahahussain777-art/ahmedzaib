@@ -716,6 +716,11 @@ class SyncService {
     await safe(() => _pullTable('zaib_customers', _applyCustomer));
     await safe(() => _pullTable('zaib_dealers', _applyDealer));
     await safe(() => _pullTable('zaib_petrol_entries', _applyPetrol));
+    try {
+      await AppDatabase.instance.purgeDuplicatePetrolEntries();
+    } catch (e) {
+      await _logFail('purge:petrol', null, e);
+    }
     await safe(() => _pullTable('zaib_dealer_payouts', _applyPayout));
     await safe(() => _pullTable('zaib_dealer_purchases', _applyPurchase));
     await safe(() => _pullTable('zaib_dealer_direct', _applyDirect));

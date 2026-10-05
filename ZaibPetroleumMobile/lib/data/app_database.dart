@@ -130,6 +130,9 @@ class AppDatabase {
         );
       }
     }
+    try {
+      await purgeDuplicatePetrolEntries();
+    } catch (_) {}
     _syncBackfillDone = true;
   }
 
@@ -240,12 +243,37 @@ class AppDatabase {
 
   Future<CustomerLedgerSummary> getCustomerLedgerSummary(int customerId) async {
     final db = await database;
+    // Match WinForms VIP: Amount jama / Credit minus (Sale + Credit rows).
     final inRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0) + IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE CustomerId = ?',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN 0
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE CustomerId = ?
+      ''',
       [customerId],
     );
     final creditRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Credit,0)),0) AS t FROM PetrolAdd WHERE CustomerId = ?',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN
+            CASE
+              WHEN IFNULL(Credit, 0) <> 0 THEN IFNULL(Credit, 0)
+              ELSE IFNULL(Amount, 0) + IFNULL(Advance, 0)
+            END
+          ELSE IFNULL(Credit, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE CustomerId = ?
+      ''',
       [customerId],
     );
     final totalAmount = asDouble(inRow.first['t']);
@@ -355,8 +383,13 @@ class AppDatabase {
       LEFT JOIN AddCustomer c ON c.id = s.CustomerId
       WHERE IFNULL(s.IsInitialEntry, 1) = 1
     ''');
-    if (q.isNotEmpty) {
-      buf.write(' AND (c.Name LIKE ? OR IFNULL(s.vehicle,\'\') LIKE ? OR IFNULL(s.ReceiptNo,\'\') LIKE ?)');
+    // WinForms VIP search: exact customer name → CustomerId only (no partial mix).
+    final exact = q.isEmpty ? null : await findCustomerByExactName(q);
+    if (exact?.id != null) {
+      buf.write(' AND s.CustomerId = ?');
+      args.add(exact!.id);
+    } else if (q.isNotEmpty) {
+      buf.write(' AND (IFNULL(s.vehicle,\'\') LIKE ? OR IFNULL(s.ReceiptNo,\'\') LIKE ? OR IFNULL(s.Note,\'\') LIKE ?)');
       args.addAll(['%$q%', '%$q%', '%$q%']);
     }
     if (from != null && from.isNotEmpty) {
@@ -398,15 +431,70 @@ class AppDatabase {
   Future<List<CreditCustomerEntry>> getCredits({String query = ''}) async {
     final db = await database;
     final q = query.trim();
-    final rows = await db.rawQuery('''
-      SELECT e.*, c.Name AS customer_name
+    final exact = q.isEmpty ? null : await findCustomerByExactName(q);
+    final args = <Object?>[];
+    final buf = StringBuffer('''
+      SELECT e.*, c.Name AS customer_name,
+        CASE
+          WHEN IFNULL(e.Credit, 0) <> 0 THEN IFNULL(e.Credit, 0)
+          ELSE IFNULL(e.Amount, 0) + IFNULL(e.Advance, 0)
+        END AS Credit
       FROM PetrolAdd e
       LEFT JOIN AddCustomer c ON c.id = e.CustomerId
       WHERE IFNULL(e.IsInitialEntry, 1) = 0
-      ${q.isEmpty ? '' : 'AND (c.Name LIKE ? OR IFNULL(e.ReceiptNo,\'\') LIKE ?)'}
-      ORDER BY e.pid DESC
-    ''', q.isEmpty ? null : ['%$q%', '%$q%']);
+    ''');
+    if (exact?.id != null) {
+      buf.write(' AND e.CustomerId = ?');
+      args.add(exact!.id);
+    } else if (q.isNotEmpty) {
+      buf.write(' AND (IFNULL(e.ReceiptNo,\'\') LIKE ? OR IFNULL(e.Note,\'\') LIKE ?)');
+      args.addAll(['%$q%', '%$q%']);
+    }
+    buf.write(' ORDER BY e.pid DESC');
+    final rows = await db.rawQuery(buf.toString(), args.isEmpty ? null : args);
     return rows.map(CreditCustomerEntry.fromMap).toList();
+  }
+
+  /// Remove duplicate PetrolAdd rows (same customer/date/amount fingerprint, different SyncId).
+  /// Keeps newest UpdatedAt; tombstones extras so cloud soft-delete follows on next push.
+  /// Skips SyncDirty=1 rows (pending local edits).
+  Future<int> purgeDuplicatePetrolEntries() async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT pid, SyncId, IFNULL(SyncDirty, 0) AS SyncDirty, UpdatedAt,
+             CustomerId, Date,
+             IFNULL(Amount, 0) AS Amount, IFNULL(Credit, 0) AS Credit,
+             IFNULL(IsInitialEntry, 1) AS IsInitialEntry,
+             IFNULL(Advance, 0) AS Advance, IFNULL(Litter, 0) AS Litter, IFNULL(Rate, 0) AS Rate,
+             IFNULL(ReceiptNo, '') AS ReceiptNo, IFNULL(vehicle, '') AS vehicle
+      FROM PetrolAdd
+      ORDER BY CustomerId, Date, Amount, Credit, IsInitialEntry, Advance, Litter, Rate, ReceiptNo, vehicle,
+               UpdatedAt DESC, pid DESC
+    ''');
+    final seen = <String>{};
+    final remove = <Map<String, Object?>>[];
+    for (final r in rows) {
+      final key =
+          '${r['CustomerId']}|${r['Date']}|${r['Amount']}|${r['Credit']}|${r['IsInitialEntry']}|${r['Advance']}|${r['Litter']}|${r['Rate']}|${r['ReceiptNo']}|${r['vehicle']}';
+      if (seen.contains(key)) {
+        remove.add(r);
+      } else {
+        seen.add(key);
+      }
+    }
+    if (remove.isEmpty) return 0;
+    return _runLocalWrite((txn) async {
+      var n = 0;
+      for (final r in remove) {
+        final dirty = r['SyncDirty'];
+        final dirtyInt = dirty is int ? dirty : int.tryParse('$dirty') ?? 0;
+        if (dirtyInt == 1) continue;
+        final syncId = r['SyncId']?.toString();
+        await _tombstone('zaib_petrol_entries', syncId, txn);
+        n += await txn.delete('PetrolAdd', where: 'pid = ?', whereArgs: [r['pid']]);
+      }
+      return n;
+    });
   }
 
   // ---------- Dealers (AddDealer) ----------
@@ -756,10 +844,34 @@ class AppDatabase {
     final db = await database;
     final filter = _dateFilterSql('Date', year: year, month: month, from: from, to: to);
     final inRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0) + IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE 1=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN 0
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE 1=1$filter
+      ''',
     );
     final creditRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Credit,0)),0) AS t FROM PetrolAdd WHERE 1=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN
+            CASE
+              WHEN IFNULL(Credit, 0) <> 0 THEN IFNULL(Credit, 0)
+              ELSE IFNULL(Amount, 0) + IFNULL(Advance, 0)
+            END
+          ELSE IFNULL(Credit, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE 1=1$filter
+      ''',
     );
     final totalAmount = asDouble(inRow.first['t']);
     final totalCredit = asDouble(creditRow.first['t']);
@@ -790,7 +902,17 @@ class AppDatabase {
       'SELECT IFNULL(SUM(IFNULL(AddDisel,0)),0) AS t FROM AddStock WHERE 1=1$filter',
     )).first['t']);
     final saleAmount = asDouble((await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0)+IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE IFNULL(IsInitialEntry,1)=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE IFNULL(IsInitialEntry,1)=1$filter
+      ''',
     )).first['t']);
     final purchaseAmount = asDouble((await db.rawQuery(
       'SELECT IFNULL(SUM(IFNULL(AddDisel,0)*IFNULL(Rate,0)),0) AS t FROM AddStock WHERE 1=1$filter',

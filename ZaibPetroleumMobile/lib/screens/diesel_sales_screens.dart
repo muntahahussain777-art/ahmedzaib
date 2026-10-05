@@ -200,7 +200,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
                                             ),
                                           ),
                                           Text(
-                                            s.amount.toStringAsFixed(0),
+                                            s.vipAmount.toStringAsFixed(0),
                                             style: GoogleFonts.manrope(
                                               color: AppColors.gold,
                                               fontWeight: FontWeight.w800,
