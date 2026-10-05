@@ -130,9 +130,6 @@ class AppDatabase {
         );
       }
     }
-    try {
-      await purgeDuplicatePetrolEntries();
-    } catch (_) {}
     _syncBackfillDone = true;
   }
 
@@ -455,10 +452,9 @@ class AppDatabase {
     return rows.map(CreditCustomerEntry.fromMap).toList();
   }
 
-  /// Remove duplicate PetrolAdd rows (same customer/date/amount fingerprint, different SyncId).
-  /// Keeps newest UpdatedAt; tombstones extras so cloud soft-delete follows on next push.
-  /// Skips SyncDirty=1 rows (pending local edits).
-  Future<int> purgeDuplicatePetrolEntries() async {
+  /// Read-only: groups PetrolAdd rows that share business values but different SyncIds.
+  /// Does NOT delete — identical values may be legitimate distinct sales.
+  Future<List<Map<String, Object?>>> listSuspectedDuplicatePetrolEntries() async {
     final db = await database;
     final rows = await db.rawQuery('''
       SELECT pid, SyncId, IFNULL(SyncDirty, 0) AS SyncDirty, UpdatedAt,
@@ -471,30 +467,34 @@ class AppDatabase {
       ORDER BY CustomerId, Date, Amount, Credit, IsInitialEntry, Advance, Litter, Rate, ReceiptNo, vehicle,
                UpdatedAt DESC, pid DESC
     ''');
-    final seen = <String>{};
-    final remove = <Map<String, Object?>>[];
+    final byKey = <String, List<Map<String, Object?>>>{};
     for (final r in rows) {
       final key =
           '${r['CustomerId']}|${r['Date']}|${r['Amount']}|${r['Credit']}|${r['IsInitialEntry']}|${r['Advance']}|${r['Litter']}|${r['Rate']}|${r['ReceiptNo']}|${r['vehicle']}';
-      if (seen.contains(key)) {
-        remove.add(r);
-      } else {
-        seen.add(key);
+      byKey.putIfAbsent(key, () => []).add(r);
+    }
+    final suspected = <Map<String, Object?>>[];
+    for (final e in byKey.entries) {
+      final group = e.value;
+      if (group.length < 2) continue;
+      final syncIds = group.map((r) => '${r['SyncId'] ?? ''}').where((s) => s.isNotEmpty).toSet();
+      if (syncIds.length < 2) continue; // same SyncId = not distinct
+      for (final r in group) {
+        suspected.add({
+          ...r,
+          'fingerprint': e.key,
+          'groupSize': group.length,
+        });
       }
     }
-    if (remove.isEmpty) return 0;
-    return _runLocalWrite((txn) async {
-      var n = 0;
-      for (final r in remove) {
-        final dirty = r['SyncDirty'];
-        final dirtyInt = dirty is int ? dirty : int.tryParse('$dirty') ?? 0;
-        if (dirtyInt == 1) continue;
-        final syncId = r['SyncId']?.toString();
-        await _tombstone('zaib_petrol_entries', syncId, txn);
-        n += await txn.delete('PetrolAdd', where: 'pid = ?', whereArgs: [r['pid']]);
-      }
-      return n;
-    });
+    return suspected;
+  }
+
+  /// @deprecated Automatic fingerprint deletion removed — use [listSuspectedDuplicatePetrolEntries].
+  @Deprecated('Do not auto-delete by value fingerprint; SyncId is identity')
+  Future<int> purgeDuplicatePetrolEntries() async {
+    // No-op: preserve distinct SyncIds. Callers should use listSuspectedDuplicatePetrolEntries.
+    return 0;
   }
 
   // ---------- Dealers (AddDealer) ----------

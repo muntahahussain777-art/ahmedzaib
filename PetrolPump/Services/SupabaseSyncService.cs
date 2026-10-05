@@ -210,6 +210,10 @@ namespace ZaibPetroleumService.Services
                 EnsureTrigger(con, "trg_sync_BankTransactions_au", "BankTransactions", "UPDATE", "TransactionDate,TransactionType,CustomerId,DealerId,Amount,Note,BankName");
                 EnsureTrigger(con, "trg_sync_Expensetable_ai", "Expensetable", "INSERT", "Name,Category,Amount,EDate,Note");
                 EnsureTrigger(con, "trg_sync_Expensetable_au", "Expensetable", "UPDATE", "Name,Category,Amount,EDate,Note");
+
+                // Stale guard from crash/older builds must not permanently disable dirty tracking.
+                // Never mass-mark rows dirty — that would overwrite cloud on next push.
+                ClearStaleRemoteApplyGuard(con);
             }
         }
 
@@ -233,6 +237,10 @@ END;";
             Exec(con, sql);
         }
 
+        /// <summary>
+        /// Suppress dirty triggers only while remote rows are written locally.
+        /// Must stay inside the same short SQLite write transaction — never across network awaits.
+        /// </summary>
         private static void BeginRemoteApply(SQLiteConnection con)
         {
             try { Exec(con, "INSERT OR IGNORE INTO SyncApplyGuard(Id) VALUES(1)"); } catch { }
@@ -241,6 +249,30 @@ END;";
         private static void EndRemoteApply(SQLiteConnection con)
         {
             try { Exec(con, "DELETE FROM SyncApplyGuard"); } catch { }
+        }
+
+        /// <summary>
+        /// Older builds left SyncApplyGuard(1) while awaiting HTTP. Clear it safely without
+        /// marking every row SyncDirty=1 (that would force-upload and overwrite cloud).
+        /// </summary>
+        private static void ClearStaleRemoteApplyGuard(SQLiteConnection con)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand("SELECT COUNT(*) FROM SyncApplyGuard", con))
+                {
+                    var n = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
+                    if (n <= 0) return;
+                }
+                EndRemoteApply(con);
+                try
+                {
+                    LogFail(con, "syncApplyGuard", null,
+                        new Exception("Cleared stale SyncApplyGuard without mass-dirty (concurrent edits resume tracking)."));
+                }
+                catch { }
+            }
+            catch { }
         }
 
         private static void LogFail(SQLiteConnection con, string scope, string syncId, Exception ex)
@@ -332,6 +364,9 @@ END;";
                 {
                     con.Open();
                     // Deletes first, then parents→children, then protected pull.
+                    // Clear any leftover guard before push so local dirty tracking stays live.
+                    ClearStaleRemoteApplyGuard(con);
+
                     await PushTombstones(con);
                     await PushCustomers(con);
                     await PushDealers(con);
@@ -343,24 +378,56 @@ END;";
                     await PushBank(con);
                     await PushExpenses(con);
 
-                    BeginRemoteApply(con);
-                    try
+                    // Fetch ALL remote pages first — no SyncApplyGuard during network I/O.
+                    // Concurrent user edits on other SQLite connections keep firing dirty triggers.
+                    var remoteCustomers = await SelectSincePagedAsync("zaib_customers");
+                    var remoteDealers = await SelectSincePagedAsync("zaib_dealers");
+                    var remotePetrol = await SelectSincePagedAsync("zaib_petrol_entries");
+                    var remotePayouts = await SelectSincePagedAsync("zaib_dealer_payouts");
+                    var remotePurchases = await SelectSincePagedAsync("zaib_dealer_purchases");
+                    var remoteDirect = await SelectSincePagedAsync("zaib_dealer_direct");
+                    var remoteStock = await SelectSincePagedAsync("zaib_stock_diesel");
+                    var remoteBank = await SelectSincePagedAsync("zaib_bank_transactions");
+                    var remoteExpenses = await SelectSincePagedAsync("zaib_expenses");
+
+                    // Apply under one short write txn + guard. No awaits while guard is active.
+                    // Checkpoints only advance after successful commit (avoid skip-after-rollback).
+                    string custCp = null, dealerCp = null, petrolCp = null, payoutCp = null,
+                        purchaseCp = null, directCp = null, stockCp = null, bankCp = null, expenseCp = null;
+                    using (var tx = con.BeginTransaction())
                     {
-                        await PullCustomers(con);
-                        await PullDealers(con);
-                        await PullPetrol(con);
-                        await PullPayouts(con);
-                        await PullPurchases(con);
-                        await PullDirect(con);
-                        await PullStock(con);
-                        await PullBank(con);
-                        await PullExpenses(con);
-                        await FlushStaged(con);
+                        try
+                        {
+                            BeginRemoteApply(con);
+                            custCp = ApplyCustomers(con, remoteCustomers);
+                            dealerCp = ApplyDealers(con, remoteDealers);
+                            petrolCp = ApplyPetrol(con, remotePetrol);
+                            payoutCp = ApplyPayouts(con, remotePayouts);
+                            purchaseCp = ApplyPurchases(con, remotePurchases);
+                            directCp = ApplyDirect(con, remoteDirect);
+                            stockCp = ApplyStock(con, remoteStock);
+                            bankCp = ApplyBank(con, remoteBank);
+                            expenseCp = ApplyExpenses(con, remoteExpenses);
+                            FlushStaged(con);
+                            EndRemoteApply(con);
+                            tx.Commit();
+                        }
+                        catch
+                        {
+                            try { EndRemoteApply(con); } catch { }
+                            try { tx.Rollback(); } catch { }
+                            throw;
+                        }
                     }
-                    finally
-                    {
-                        EndRemoteApply(con);
-                    }
+                    SetCheckpoint("zaib_customers", custCp);
+                    SetCheckpoint("zaib_dealers", dealerCp);
+                    SetCheckpoint("zaib_petrol_entries", petrolCp);
+                    SetCheckpoint("zaib_dealer_payouts", payoutCp);
+                    SetCheckpoint("zaib_dealer_purchases", purchaseCp);
+                    SetCheckpoint("zaib_dealer_direct", directCp);
+                    SetCheckpoint("zaib_stock_diesel", stockCp);
+                    SetCheckpoint("zaib_bank_transactions", bankCp);
+                    SetCheckpoint("zaib_expenses", expenseCp);
                 }
             }
             catch (Exception ex)
@@ -949,10 +1016,10 @@ END;";
             return false;
         }
 
-        private static async Task PullCustomers(SQLiteConnection con)
+        private static string ApplyCustomers(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_customers");
-            foreach (var r in await SelectSincePagedAsync("zaib_customers"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1000,13 +1067,13 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_customers", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_customers", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullDealers(SQLiteConnection con)
+        private static string ApplyDealers(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_dealers");
-            foreach (var r in await SelectSincePagedAsync("zaib_dealers"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1068,13 +1135,13 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_dealers", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_dealers", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullPetrol(SQLiteConnection con)
+        private static string ApplyPetrol(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_petrol_entries");
-            foreach (var r in await SelectSincePagedAsync("zaib_petrol_entries"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1127,15 +1194,15 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_petrol_entries", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_petrol_entries", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullPayouts(SQLiteConnection con)
+        private static string ApplyPayouts(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_dealer_payouts");
-            foreach (var r in await SelectSincePagedAsync("zaib_dealer_payouts"))
+            foreach (var r in rows)
             {
-                bool applied = await UpsertChild(con, "DieselLedgerCredit", "LedgerID", "zaib_dealer_payouts", r,
+                bool applied = UpsertChild(con, "DieselLedgerCredit", "LedgerID", "zaib_dealer_payouts", r,
                     (cmd, row, did) =>
                     {
                         cmd.Parameters.AddWithValue("@Did", did);
@@ -1148,13 +1215,13 @@ END;";
                 if (applied)
                     AdvanceCheckpoint("zaib_dealer_payouts", r.Value<string>("updated_at"), ref appliedMax);
             }
-            SetCheckpoint("zaib_dealer_payouts", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullPurchases(SQLiteConnection con)
+        private static string ApplyPurchases(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_dealer_purchases");
-            foreach (var r in await SelectSincePagedAsync("zaib_dealer_purchases"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1200,15 +1267,15 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_dealer_purchases", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_dealer_purchases", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullDirect(SQLiteConnection con)
+        private static string ApplyDirect(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_dealer_direct");
-            foreach (var r in await SelectSincePagedAsync("zaib_dealer_direct"))
+            foreach (var r in rows)
             {
-                bool applied = await UpsertChild(con, "DieselLedgerDebit", "LedgerID", "zaib_dealer_direct", r,
+                bool applied = UpsertChild(con, "DieselLedgerDebit", "LedgerID", "zaib_dealer_direct", r,
                     (cmd, row, did) =>
                     {
                         cmd.Parameters.AddWithValue("@Did", did);
@@ -1221,13 +1288,13 @@ END;";
                 if (applied)
                     AdvanceCheckpoint("zaib_dealer_direct", r.Value<string>("updated_at"), ref appliedMax);
             }
-            SetCheckpoint("zaib_dealer_direct", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullStock(SQLiteConnection con)
+        private static string ApplyStock(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_stock_diesel");
-            foreach (var r in await SelectSincePagedAsync("zaib_stock_diesel"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1275,13 +1342,13 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_stock_diesel", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_stock_diesel", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullBank(SQLiteConnection con)
+        private static string ApplyBank(SQLiteConnection con, IEnumerable<JObject> rows)
         {
             string appliedMax = GetCheckpoint("zaib_bank_transactions");
-            foreach (var r in await SelectSincePagedAsync("zaib_bank_transactions"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1331,14 +1398,14 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_bank_transactions", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_bank_transactions", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task PullExpenses(SQLiteConnection con)
+        private static string ApplyExpenses(SQLiteConnection con, IEnumerable<JObject> rows)
         {
-            if (!TableExists(con, "Expensetable")) return;
+            if (!TableExists(con, "Expensetable")) return GetCheckpoint("zaib_expenses");
             string appliedMax = GetCheckpoint("zaib_expenses");
-            foreach (var r in await SelectSincePagedAsync("zaib_expenses"))
+            foreach (var r in rows)
             {
                 string syncId = r.Value<string>("sync_id");
                 if (string.IsNullOrWhiteSpace(syncId)) continue;
@@ -1376,10 +1443,10 @@ END;";
                 }
                 AdvanceCheckpoint("zaib_expenses", updated, ref appliedMax);
             }
-            SetCheckpoint("zaib_expenses", appliedMax);
+            return appliedMax;
         }
 
-        private static async Task FlushStaged(SQLiteConnection con)
+        private static void FlushStaged(SQLiteConnection con)
         {
             if (!TableExists(con, "SyncStagedRemote")) return;
             var dt = QueryDirty(con, "SELECT * FROM SyncStagedRemote ORDER BY UpdatedAt ASC");
@@ -1440,7 +1507,7 @@ END;";
                     }
                     else if (cloud == "zaib_dealer_payouts")
                     {
-                        applied = await UpsertChild(con, "DieselLedgerCredit", "LedgerID", cloud, payload,
+                        applied = UpsertChild(con, "DieselLedgerCredit", "LedgerID", cloud, payload,
                             (cmd, row2, did) =>
                             {
                                 cmd.Parameters.AddWithValue("@Did", did);
@@ -1452,7 +1519,7 @@ END;";
                     }
                     else if (cloud == "zaib_dealer_direct")
                     {
-                        applied = await UpsertChild(con, "DieselLedgerDebit", "LedgerID", cloud, payload,
+                        applied = UpsertChild(con, "DieselLedgerDebit", "LedgerID", cloud, payload,
                             (cmd, row2, did) =>
                             {
                                 cmd.Parameters.AddWithValue("@Did", did);
@@ -1480,7 +1547,7 @@ END;";
             }
         }
 
-        private static Task<bool> UpsertChild(
+        private static bool UpsertChild(
             SQLiteConnection con,
             string localTable,
             string pk,
@@ -1493,22 +1560,22 @@ END;";
             string parentSyncField)
         {
             string syncId = r.Value<string>("sync_id");
-            if (string.IsNullOrWhiteSpace(syncId)) return Task.FromResult(true);
+            if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
             bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
             if (!ShouldApply(con, localTable, syncId, updated, deleted, r.Value<string>("device_id")))
-                return Task.FromResult(true);
+                return true;
             if (deleted)
             {
                 ApplyRemoteDelete(con, localTable, syncId);
-                return Task.FromResult(true);
+                return true;
             }
             string parentSync = r.Value<string>(parentSyncField);
             object parentId = LocalIdBySync(con, parentTable, parentPk, parentSync);
             if (!string.IsNullOrWhiteSpace(parentSync) && (parentId == null || parentId == DBNull.Value))
             {
                 if (r is JObject jo) StageRemote(con, cloudTable, jo);
-                return Task.FromResult(false);
+                return false;
             }
             using (var chk = new SQLiteCommand($"SELECT {pk} FROM {localTable} WHERE SyncId=@s", con))
             {
@@ -1525,7 +1592,7 @@ END;";
                     cmd.ExecuteNonQuery();
                 }
             }
-            return Task.FromResult(true);
+            return true;
         }
     }
 }

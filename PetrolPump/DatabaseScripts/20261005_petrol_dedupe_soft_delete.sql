@@ -1,6 +1,9 @@
 -- Soft-delete duplicate zaib_petrol_entries (same business fingerprint, different sync_id).
 -- Keeps newest updated_at so WinForms updates win. Repeatable / additive.
 -- Applied 2026-10-05 on project hvcfaslsgewdfblfdsdn.
+--
+-- DO NOT RE-RUN. Value fingerprints are not SyncId identity; distinct SyncIds may be
+-- legitimate sales. Use 20261005_petrol_duplicate_report_readonly.sql for inspection only.
 
 WITH ranked AS (
   SELECT sync_id,

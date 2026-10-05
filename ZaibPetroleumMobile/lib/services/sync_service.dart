@@ -716,11 +716,7 @@ class SyncService {
     await safe(() => _pullTable('zaib_customers', _applyCustomer));
     await safe(() => _pullTable('zaib_dealers', _applyDealer));
     await safe(() => _pullTable('zaib_petrol_entries', _applyPetrol));
-    try {
-      await AppDatabase.instance.purgeDuplicatePetrolEntries();
-    } catch (e) {
-      await _logFail('purge:petrol', null, e);
-    }
+    // Value-fingerprint auto-purge disabled — SyncId is identity; identical values may both be real.
     await safe(() => _pullTable('zaib_dealer_payouts', _applyPayout));
     await safe(() => _pullTable('zaib_dealer_purchases', _applyPurchase));
     await safe(() => _pullTable('zaib_dealer_direct', _applyDirect));
