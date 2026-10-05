@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.SQLite;
@@ -203,8 +203,25 @@ namespace ZaibPetroleumService.Services
                 Exec(con, @"CREATE TABLE IF NOT EXISTS SyncTombstone (
                     SyncId TEXT PRIMARY KEY,
                     CloudTable TEXT NOT NULL,
-                    DeletedAt TEXT NOT NULL
+                    DeletedAt TEXT NOT NULL,
+                    ExpectedServerRev INTEGER,
+                    RequestId TEXT
                 );");
+                try
+                {
+                    if (!ColumnExists(con, "SyncTombstone", "ExpectedServerRev"))
+                    {
+                        TryBackupBeforeTombstoneMigration();
+                        DatabaseSchemaManager.EnsureColumn(con, "SyncTombstone", "ExpectedServerRev", "INTEGER");
+                        DatabaseSchemaManager.EnsureColumn(con, "SyncTombstone", "RequestId", "TEXT");
+                    }
+                    else
+                    {
+                        DatabaseSchemaManager.EnsureColumn(con, "SyncTombstone", "ExpectedServerRev", "INTEGER");
+                        DatabaseSchemaManager.EnsureColumn(con, "SyncTombstone", "RequestId", "TEXT");
+                    }
+                }
+                catch { }
                 Exec(con, @"CREATE TABLE IF NOT EXISTS SyncApplyGuard (
                     Id INTEGER PRIMARY KEY CHECK (Id = 1)
                 );");
@@ -439,6 +456,51 @@ END;";
                 return cmd.ExecuteScalar() != null;
             }
         }
+
+        private static bool ColumnExists(SQLiteConnection con, string table, string column)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand($"PRAGMA table_info({table})", con))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        if (string.Equals(Convert.ToString(r["name"]), column, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static void TryBackupBeforeTombstoneMigration()
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DiselPetrolPump", "migrations");
+                Directory.CreateDirectory(dir);
+                string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                string dest = Path.Combine(dir, "pre_tombstone_rev_" + stamp + ".db");
+                DatabaseBackupHelper.CreateSqliteBackup(dest);
+                // Also copy WAL/SHM if present beside live DB (consistent snapshot alongside BackupDatabase).
+                string live = DatabaseBackupHelper.GetDatabaseFilePath();
+                foreach (var suffix in new[] { "-wal", "-shm" })
+                {
+                    string src = live + suffix;
+                    if (File.Exists(src))
+                        File.Copy(src, dest + suffix, true);
+                }
+            }
+            catch { /* never block sync on backup failure */ }
+        }
+
+        /// <summary>Conflict-adoption only: bypass SyncDirty + timestamp veto; still respects tombstones.</summary>
+        [ThreadStatic]
+        private static bool _forceAuthoritativeApply;
 
         private static void Exec(SQLiteConnection con, string sql)
         {
@@ -692,7 +754,7 @@ END;";
 
         private enum UploadAck { Accepted, Duplicate, Conflict, Deleted, Failure, Unknown }
 
-        private static async Task<UploadAck> UpsertAsync(string table, object row, long? expectedServerRev = null)
+        private static async Task<UploadAck> UpsertAsync(string table, object row, long? expectedServerRev = null, string requestIdOverride = null)
         {
             string json = JsonConvert.SerializeObject(row);
             var uploaded = JObject.Parse(json);
@@ -700,7 +762,9 @@ END;";
             string upAt = uploaded.Value<string>("updated_at");
             string upDev = uploaded.Value<string>("device_id");
             string syncId = uploaded.Value<string>("sync_id");
-            string requestId = StableRequestId(table, syncId, upAt);
+            string requestId = !string.IsNullOrWhiteSpace(requestIdOverride)
+                ? requestIdOverride
+                : StableRequestId(table, syncId, upAt);
 
             try
             {
@@ -870,6 +934,10 @@ END;";
             }
             bool sameVersion = !string.IsNullOrWhiteSpace(localNow) && !string.IsNullOrWhiteSpace(uploadedUpdatedAt)
                 && string.Equals(localNow, uploadedUpdatedAt, StringComparison.Ordinal);
+            bool serverDeleted = serverJo != null
+                && serverJo["deleted_at"] != null && serverJo["deleted_at"].Type != JTokenType.Null;
+            if (HasTombstone(con, syncId) && !serverDeleted)
+                sameVersion = false; // preserve pending delete over live adopt
             string outcome = sameVersion ? "adoptServerClearDirty" : "keepLocalDirtyStageServer";
             try
             {
@@ -889,18 +957,65 @@ END;";
             }
             catch { }
 
-            if (sameVersion)
+            if (sameVersion && serverJo != null)
             {
-                // Adopt server: clear dirty AND take server_rev as new base (local was still at rejected version).
-                long? srv = serverJo?.Value<long?>("server_rev");
-                if (srv.HasValue && srv.Value > 0)
-                    StoreServerRev(con, localTable, pk, id, srv.Value);
-                using (var cmd = new SQLiteCommand(
-                    $"UPDATE {localTable} SET SyncDirty=0 WHERE {pk}=@id AND UpdatedAt=@u", con))
+                // Atomic adopt: apply authoritative values/deletion + balances + ServerRev + dirty + clear staged.
+                using (var tx = con.BeginTransaction())
                 {
-                    cmd.Parameters.AddWithValue("@id", id);
-                    cmd.Parameters.AddWithValue("@u", uploadedUpdatedAt ?? "");
-                    cmd.ExecuteNonQuery();
+                    try
+                    {
+                        string stillAt = null;
+                        using (var cmd = new SQLiteCommand($"SELECT UpdatedAt FROM {localTable} WHERE {pk}=@id LIMIT 1", con, tx))
+                        {
+                            cmd.Parameters.AddWithValue("@id", id);
+                            var v = cmd.ExecuteScalar();
+                            stillAt = v == null || v == DBNull.Value ? null : Convert.ToString(v);
+                        }
+                        if (!string.IsNullOrWhiteSpace(stillAt)
+                            && !string.Equals(stillAt, uploadedUpdatedAt, StringComparison.Ordinal))
+                        {
+                            tx.Rollback();
+                            return; // mid-upload newer edit
+                        }
+                        if (HasTombstone(con, syncId) && !serverDeleted)
+                        {
+                            tx.Rollback();
+                            return;
+                        }
+
+                        bool prev = _forceAuthoritativeApply;
+                        _forceAuthoritativeApply = true;
+                        try
+                        {
+                            bool applied = ApplySyncChangeRow(con, new JObject
+                            {
+                                ["cloud_table"] = cloudTable,
+                                ["row_sync_id"] = syncId,
+                                ["op"] = serverDeleted ? "delete" : "upsert",
+                                ["payload"] = serverJo
+                            });
+                            if (!applied)
+                                throw new InvalidOperationException("adoption blocked (missing parent) — retain dirty");
+                        }
+                        finally
+                        {
+                            _forceAuthoritativeApply = prev;
+                        }
+
+                        using (var cmd = new SQLiteCommand(
+                            "DELETE FROM SyncStagedRemote WHERE CloudTable=@t AND SyncId=@s", con, tx))
+                        {
+                            cmd.Parameters.AddWithValue("@t", cloudTable);
+                            cmd.Parameters.AddWithValue("@s", syncId);
+                            cmd.ExecuteNonQuery();
+                        }
+                        tx.Commit();
+                    }
+                    catch (Exception ex)
+                    {
+                        try { tx.Rollback(); } catch { }
+                        LogFail(con, "upload:adopt-rollback:" + cloudTable, syncId, ex);
+                    }
                 }
             }
             // Mid-upload edit: keep dirty and keep prior ServerRev base; staged remote for later.
@@ -1042,13 +1157,16 @@ END;";
         }
 
         private static RemoteApplyGate ClassifyRemoteApply(
-            SQLiteConnection con, string localTable, string syncId, string updated, bool deleted, string remoteDeviceId)
+            SQLiteConnection con, string localTable, string syncId, string updated, bool deleted, string remoteDeviceId,
+            long? remoteServerRev = null)
         {
             if (HasTombstone(con, syncId))
                 return deleted ? RemoteApplyGate.Apply : RemoteApplyGate.SkipStage;
-            if (IsSyncDirty(con, localTable, syncId))
+            if (!_forceAuthoritativeApply && IsSyncDirty(con, localTable, syncId))
                 return RemoteApplyGate.SkipStage;
-            if (ShouldApply(con, localTable, syncId, updated, deleted, remoteDeviceId))
+            if (_forceAuthoritativeApply)
+                return RemoteApplyGate.Apply;
+            if (ShouldApply(con, localTable, syncId, updated, deleted, remoteDeviceId, remoteServerRev))
                 return RemoteApplyGate.Apply;
             return RemoteApplyGate.SkipDone;
         }
@@ -1148,7 +1266,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "AddCustomer", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "AddCustomer", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_customers", r);
@@ -1194,7 +1312,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "AddDealer", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "AddDealer", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_dealers", r);
@@ -1238,7 +1356,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "PetrolAdd", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "PetrolAdd", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_petrol_entries", r);
@@ -1289,7 +1407,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "AddStock", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "AddStock", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_dealer_purchases", r);
@@ -1341,7 +1459,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "StockDiesel", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "StockDiesel", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_stock_diesel", r);
@@ -1387,7 +1505,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "BankTransactions", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "BankTransactions", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_bank_transactions", r);
@@ -1435,7 +1553,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "Expensetable", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "Expensetable", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_expenses", r);
@@ -1472,7 +1590,7 @@ END;";
             string syncId = r.Value<string>("sync_id");
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
-            var gate = ClassifyRemoteApply(con, "DealertoDealer", syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, "DealertoDealer", syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 StageRemote(con, "zaib_dealer_transfers", r);
@@ -2008,6 +2126,21 @@ END;";
                 string table = Convert.ToString(r["CloudTable"]);
                 string syncId = Convert.ToString(r["SyncId"]);
                 string deletedAt = Convert.ToString(r["DeletedAt"]);
+                long? expectedRev = null;
+                if (r.Table.Columns.Contains("ExpectedServerRev") && r["ExpectedServerRev"] != DBNull.Value)
+                {
+                    try
+                    {
+                        long v = Convert.ToInt64(r["ExpectedServerRev"]);
+                        if (v > 0) expectedRev = v;
+                    }
+                    catch { }
+                }
+                string requestId = null;
+                if (r.Table.Columns.Contains("RequestId") && r["RequestId"] != DBNull.Value)
+                    requestId = Convert.ToString(r["RequestId"]);
+                if (string.IsNullOrWhiteSpace(requestId))
+                    requestId = LocalPersistence.StableTombstoneRequestId(table, syncId, deletedAt);
                 try
                 {
                     var ack = await UpsertAsync(table, new
@@ -2016,32 +2149,45 @@ END;";
                         updated_at = deletedAt,
                         deleted_at = deletedAt,
                         device_id = _deviceId
-                    });
-                    if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate)
+                    }, expectedRev, requestId);
+                    if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate || ack == UploadAck.Deleted)
                     {
-                        using (var d = new SQLiteCommand("DELETE FROM SyncTombstone WHERE SyncId=@s", con))
+                        using (var d = new SQLiteCommand(
+                            "DELETE FROM SyncTombstone WHERE SyncId=@s AND DeletedAt=@d", con))
                         {
                             d.Parameters.AddWithValue("@s", syncId);
+                            d.Parameters.AddWithValue("@d", deletedAt ?? "");
                             d.ExecuteNonQuery();
                         }
                     }
                     else if (ack == UploadAck.Conflict)
                     {
-                        // Idempotent: if server already has deleted_at, clear local tombstone.
+                        // Do NOT learn a newer rev and retry. Evidence-only clear, else retain.
                         try
                         {
-                            var res = await Http.GetAsync($"{Url}/rest/v1/{table}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=deleted_at&limit=1");
+                            var res = await Http.GetAsync($"{Url}/rest/v1/{table}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=deleted_at,server_rev&limit=1");
                             if (res.IsSuccessStatusCode)
                             {
                                 var body = await res.Content.ReadAsStringAsync();
                                 var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
                                 if (arr.Count > 0 && arr[0]["deleted_at"] != null && arr[0]["deleted_at"].Type != JTokenType.Null)
                                 {
-                                    using (var d = new SQLiteCommand("DELETE FROM SyncTombstone WHERE SyncId=@s", con))
+                                    using (var d = new SQLiteCommand(
+                                        "DELETE FROM SyncTombstone WHERE SyncId=@s AND DeletedAt=@d", con))
                                     {
                                         d.Parameters.AddWithValue("@s", syncId);
+                                        d.Parameters.AddWithValue("@d", deletedAt ?? "");
                                         d.ExecuteNonQuery();
                                     }
+                                }
+                                else
+                                {
+                                    LogFail(con, "push:tombstone:conflict", syncId,
+                                        new Exception(expectedRev == null
+                                            ? "legacy tombstone missing ExpectedServerRev — retain delete intent"
+                                            : "delete conflict — retain tombstone; no blind overwrite"));
+                                    if (arr.Count > 0 && arr[0] is JObject jo)
+                                        StageRemote(con, table, jo);
                                 }
                             }
                         }
@@ -2090,21 +2236,46 @@ END;";
             }
         }
 
-        private static bool ShouldApply(SQLiteConnection con, string table, string syncId, string remoteUpdated, bool remoteDeleted, string remoteDeviceId)
+        private static bool ShouldApply(SQLiteConnection con, string table, string syncId, string remoteUpdated, bool remoteDeleted, string remoteDeviceId, long? remoteServerRev = null)
         {
             if (HasTombstone(con, syncId))
             {
                 // Keep local tombstone until push ack; never resurrect from stale live row.
                 return remoteDeleted;
             }
-            using (var cmd = new SQLiteCommand($"SELECT UpdatedAt, SyncDirty FROM {table} WHERE SyncId=@s LIMIT 1", con))
+            using (var cmd = new SQLiteCommand($"SELECT UpdatedAt, SyncDirty, ServerRev FROM {table} WHERE SyncId=@s LIMIT 1", con))
             {
                 cmd.Parameters.AddWithValue("@s", syncId);
                 using (var r = cmd.ExecuteReader())
                 {
                     if (!r.Read()) return true;
                     int dirty = r["SyncDirty"] == DBNull.Value ? 0 : Convert.ToInt32(r["SyncDirty"]);
-                    if (dirty == 1) return false; // protect pending edits
+                    if (!_forceAuthoritativeApply && dirty == 1) return false;
+                    if (_forceAuthoritativeApply) return true;
+
+                    long? localRev = null;
+                    if (r["ServerRev"] != DBNull.Value)
+                    {
+                        try
+                        {
+                            long v = Convert.ToInt64(r["ServerRev"]);
+                            if (v > 0) localRev = v;
+                        }
+                        catch { }
+                    }
+                    long? remoteRev = remoteServerRev.HasValue && remoteServerRev.Value > 0 ? remoteServerRev : null;
+                    if (remoteRev.HasValue)
+                    {
+                        if (localRev.HasValue)
+                        {
+                            if (remoteRev.Value > localRev.Value) return true;
+                            if (remoteRev.Value < localRev.Value) return false;
+                            return remoteDeleted;
+                        }
+                        // Local missing trusted rev — apply authoritative cloud.
+                        return true;
+                    }
+
                     DateTime local = DateTime.TryParse(Convert.ToString(r["UpdatedAt"]), out var lt) ? lt.ToUniversalTime() : DateTime.MinValue;
                     DateTime remote = DateTime.TryParse(remoteUpdated, out var rt) ? rt.ToUniversalTime() : DateTime.MinValue;
                     int cmp = remote.CompareTo(local);
@@ -2126,12 +2297,15 @@ END;";
         private static void ApplyRemoteDelete(SQLiteConnection con, string table, string syncId)
         {
             if (string.IsNullOrWhiteSpace(syncId)) return;
-            if (HasTombstone(con, syncId)) return;
-            using (var chk = new SQLiteCommand($"SELECT SyncDirty FROM {table} WHERE SyncId=@s LIMIT 1", con))
+            if (HasTombstone(con, syncId) && !_forceAuthoritativeApply) return;
+            if (!_forceAuthoritativeApply)
             {
-                chk.Parameters.AddWithValue("@s", syncId);
-                var v = chk.ExecuteScalar();
-                if (v != null && v != DBNull.Value && Convert.ToInt32(v) == 1) return;
+                using (var chk = new SQLiteCommand($"SELECT SyncDirty FROM {table} WHERE SyncId=@s LIMIT 1", con))
+                {
+                    chk.Parameters.AddWithValue("@s", syncId);
+                    var v = chk.ExecuteScalar();
+                    if (v != null && v != DBNull.Value && Convert.ToInt32(v) == 1) return;
+                }
             }
             using (var d = new SQLiteCommand($"DELETE FROM {table} WHERE SyncId=@s", con))
             {
@@ -3064,7 +3238,7 @@ END;";
             if (string.IsNullOrWhiteSpace(syncId)) return true;
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
             bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
-            var gate = ClassifyRemoteApply(con, localTable, syncId, updated, deleted, r.Value<string>("device_id"));
+            var gate = ClassifyRemoteApply(con, localTable, syncId, updated, deleted, r.Value<string>("device_id"), r.Value<long?>("server_rev"));
             if (gate == RemoteApplyGate.SkipStage)
             {
                 if (r is JObject jo) StageRemote(con, cloudTable, jo);

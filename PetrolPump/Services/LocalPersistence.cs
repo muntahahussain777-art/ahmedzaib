@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.SQLite;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ZaibPetroleumService.Services
 {
@@ -106,23 +108,61 @@ namespace ZaibPetroleumService.Services
             return dt.Rows[0];
         }
 
+        public static string StableTombstoneRequestId(string cloudTable, string syncId, string deletedAt)
+        {
+            using (var md5 = MD5.Create())
+            {
+                byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(
+                    (cloudTable ?? "") + "|" + (syncId ?? "") + "|" + (deletedAt ?? "") + "|del"));
+                return new Guid(hash).ToString();
+            }
+        }
+
         /// <summary>
-        /// Durable tombstone for cloud delete (same schema as sync triggers).
-        /// Safe if SyncId empty. Does not notify cloud until next push.
+        /// Durable tombstone for cloud delete. Captures ExpectedServerRev + stable RequestId
+        /// in the same transaction as the local delete (OCC base for upload).
         /// </summary>
-        public static void EnsureTombstone(string syncId, string cloudTable, SQLiteConnection connection, SQLiteTransaction tx)
+        public static void EnsureTombstone(
+            string syncId,
+            string cloudTable,
+            SQLiteConnection connection,
+            SQLiteTransaction tx,
+            long? expectedServerRev = null)
         {
             if (string.IsNullOrWhiteSpace(syncId) || string.IsNullOrWhiteSpace(cloudTable))
                 return;
+            string deletedAt = DateTime.UtcNow.ToString("o");
+            string requestId = StableTombstoneRequestId(cloudTable, syncId, deletedAt);
             Exec(
-                @"INSERT OR REPLACE INTO SyncTombstone(SyncId, CloudTable, DeletedAt)
-                  VALUES(@s, @t, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                new Hashtable { { "@s", syncId }, { "@t", cloudTable } },
+                @"INSERT OR REPLACE INTO SyncTombstone(SyncId, CloudTable, DeletedAt, ExpectedServerRev, RequestId)
+                  VALUES(@s, @t, @d, @r, @req)",
+                new Hashtable
+                {
+                    { "@s", syncId },
+                    { "@t", cloudTable },
+                    { "@d", deletedAt },
+                    { "@r", expectedServerRev.HasValue && expectedServerRev.Value > 0
+                        ? (object)expectedServerRev.Value : DBNull.Value },
+                    { "@req", requestId }
+                },
                 connection, tx);
+        }
+
+        private static long? ReadServerRevFromRow(DataRow row)
+        {
+            if (row == null || !row.Table.Columns.Contains("ServerRev") || row["ServerRev"] == DBNull.Value)
+                return null;
+            try
+            {
+                long v = Convert.ToInt64(row["ServerRev"]);
+                return v > 0 ? (long?)v : null;
+            }
+            catch { return null; }
         }
 
         /// <summary>
         /// Delete one local row and record SyncTombstone so pull cannot resurrect it.
+        /// Reads SyncId + ServerRev BEFORE delete in the same transaction.
         /// Returns rows deleted (0 or 1).
         /// </summary>
         public static int DeleteByPkWithTombstone(string table, string pkCol, object pk, string cloudTable)
@@ -135,7 +175,8 @@ namespace ZaibPetroleumService.Services
                 string syncId = null;
                 if (row.Table.Columns.Contains("SyncId") && row["SyncId"] != DBNull.Value)
                     syncId = Convert.ToString(row["SyncId"]);
-                EnsureTombstone(syncId, cloudTable, conn, tx);
+                long? expectedRev = ReadServerRevFromRow(row);
+                EnsureTombstone(syncId, cloudTable, conn, tx, expectedRev);
                 deleted = Exec(
                     $"DELETE FROM [{table}] WHERE [{pkCol}] = @id",
                     new Hashtable { { "@id", pk } },
@@ -148,21 +189,24 @@ namespace ZaibPetroleumService.Services
         /// <summary>
         /// Delete matching rows and tombstone each SyncId (bulk / side-effect deletes).
         /// whereSql is the predicate only (no WHERE keyword), e.g. "pid = @pid".
+        /// Preserves each row's ServerRev as ExpectedServerRev.
         /// </summary>
         public static int DeleteMatchingWithTombstones(string table, string whereSql, Hashtable ht, string cloudTable)
         {
             int deleted = 0;
             bool ok = RunInTransaction((conn, tx) =>
             {
-                DataTable ids = Select(
-                    $"SELECT SyncId FROM [{table}] WHERE {whereSql}",
+                DataTable rows = Select(
+                    $"SELECT * FROM [{table}] WHERE {whereSql}",
                     ht, conn, tx);
-                if (ids != null)
+                if (rows != null)
                 {
-                    foreach (DataRow r in ids.Rows)
+                    foreach (DataRow r in rows.Rows)
                     {
-                        if (r["SyncId"] == DBNull.Value) continue;
-                        EnsureTombstone(Convert.ToString(r["SyncId"]), cloudTable, conn, tx);
+                        if (!r.Table.Columns.Contains("SyncId") || r["SyncId"] == DBNull.Value) continue;
+                        string syncId = Convert.ToString(r["SyncId"]);
+                        long? expectedRev = ReadServerRevFromRow(r);
+                        EnsureTombstone(syncId, cloudTable, conn, tx, expectedRev);
                     }
                 }
                 deleted = Exec($"DELETE FROM [{table}] WHERE {whereSql}", ht, conn, tx);

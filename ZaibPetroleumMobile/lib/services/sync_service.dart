@@ -36,6 +36,9 @@ class SyncService {
   static const _pageSize = 500;
   static const _maxNoProgressBackoffMs = 60000;
 
+  /// When true, remote apply bypasses SyncDirty + timestamp veto (conflict adoption only).
+  bool _forceAuthoritativeApply = false;
+
   SupabaseClient get _client => Supabase.instance.client;
 
   PostgrestQueryBuilder _table(String name) => _client.from(name);
@@ -416,9 +419,13 @@ class SyncService {
       limit: 1,
     );
     final localNow = rows.isEmpty ? null : rows.first['UpdatedAt']?.toString();
+    final hasTomb = await _hasTombstone(db, syncId);
+    final serverDeleted = server != null && _isDeleted(server['deleted_at']);
     final action = SyncPolicy.reconcileRejectedUpload(
       localUpdatedAtNow: localNow,
       rejectedUploadedUpdatedAt: uploadedUpdatedAt,
+      hasLocalTombstone: hasTomb,
+      serverDeleted: serverDeleted,
     );
 
     await db.insert('SyncRejectedUpload', {
@@ -436,15 +443,49 @@ class SyncService {
     }
 
     if (action == ConflictReconcile.adoptServerClearDirty && server != null) {
-      final srv = server['server_rev'];
-      final patch = <String, Object?>{'SyncDirty': 0};
-      if (srv != null) patch['ServerRev'] = _asInt(srv);
-      await db.update(
-        localTable,
-        patch,
-        where: '$pkCol = ? AND UpdatedAt = ?',
-        whereArgs: [pk, uploadedUpdatedAt],
-      );
+      // Atomic adopt: values/deletion + balances + ServerRev + dirty + staged removal.
+      // Do not clear dirty merely because a server_rev was observed.
+      try {
+        await db.transaction((txn) async {
+          final still = await txn.query(
+            localTable,
+            columns: ['UpdatedAt'],
+            where: '$pkCol = ?',
+            whereArgs: [pk],
+            limit: 1,
+          );
+          // Row may already be gone (delete adopt) — allow when serverDeleted.
+          final stillAt = still.isEmpty ? null : still.first['UpdatedAt']?.toString();
+          if (still.isNotEmpty &&
+              !SyncPolicy.parseTs(stillAt).isAtSameMomentAs(SyncPolicy.parseTs(uploadedUpdatedAt))) {
+            // Mid-upload newer local edit — preserve dirty; staged remote retained.
+            return;
+          }
+          if (await _hasTombstone(txn, syncId) && !serverDeleted) {
+            return;
+          }
+
+          final prev = _forceAuthoritativeApply;
+          _forceAuthoritativeApply = true;
+          try {
+            final result = await _applyChangePayload(txn, cloudTable, server!);
+            if (result == RemoteApplyResult.stagedForRetry) {
+              throw StateError('adoption blocked (missing parent or protected) — retain dirty');
+            }
+          } finally {
+            _forceAuthoritativeApply = prev;
+          }
+
+          await txn.delete(
+            'SyncStagedRemote',
+            where: 'CloudTable = ? AND SyncId = ?',
+            whereArgs: [cloudTable, syncId],
+          );
+        });
+      } catch (e) {
+        await _logFail('upload:adopt-rollback:$cloudTable', syncId, e);
+        // Transaction rolled back: dirty + staged remain for retry.
+      }
     }
   }
 
@@ -478,17 +519,20 @@ class SyncService {
     return rows.isNotEmpty;
   }
 
-  /// Remote soft-delete ? local delete without leaving SyncTombstone (no push loop).
+  /// Remote soft-delete → local delete without leaving SyncTombstone (no push loop).
   Future<void> _applyRemoteDelete(DatabaseExecutor db, String table, String syncId) async {
-    if (await _hasTombstone(db, syncId)) {
-      // Local delete pending upload � keep tombstone; do not clear until push ack.
+    final force = _forceAuthoritativeApply;
+    if (await _hasTombstone(db, syncId) && !force) {
+      // Local delete pending upload — keep tombstone; do not clear until push ack.
       return;
     }
-    final rows = await db.query(table, columns: ['SyncDirty'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
-    if (rows.isNotEmpty) {
-      final dirty = rows.first['SyncDirty'];
-      final dirtyInt = dirty is int ? dirty : int.tryParse('$dirty') ?? 0;
-      if (dirtyInt == 1) return;
+    if (!force) {
+      final rows = await db.query(table, columns: ['SyncDirty'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
+      if (rows.isNotEmpty) {
+        final dirty = rows.first['SyncDirty'];
+        final dirtyInt = dirty is int ? dirty : int.tryParse('$dirty') ?? 0;
+        if (dirtyInt == 1) return;
+      }
     }
     if (table == 'DealertoDealer') {
       await DealerBalanceApply.reverse(db: db, sourceSyncId: '$syncId:from', markDealerDirty: false);
@@ -507,6 +551,7 @@ class SyncService {
     String remoteUpdated, {
     required bool remoteDeleted,
     String? remoteDeviceId,
+    int? remoteServerRev,
   }) async {
     if (await _hasTombstone(db, syncId)) {
       return SyncPolicy.classifyRemoteApply(
@@ -518,11 +563,13 @@ class SyncService {
         localDeviceId: null,
         remoteDeviceId: remoteDeviceId,
         remoteDeleted: remoteDeleted,
+        remoteServerRev: remoteServerRev,
+        forceAuthoritative: _forceAuthoritativeApply,
       );
     }
     final rows = await db.query(
       table,
-      columns: ['UpdatedAt', 'SyncDirty'],
+      columns: ['UpdatedAt', 'SyncDirty', 'ServerRev'],
       where: 'SyncId = ?',
       whereArgs: [syncId],
       limit: 1,
@@ -537,6 +584,8 @@ class SyncService {
         localDeviceId: null,
         remoteDeviceId: remoteDeviceId,
         remoteDeleted: remoteDeleted,
+        remoteServerRev: remoteServerRev,
+        forceAuthoritative: _forceAuthoritativeApply,
       );
     }
     final dirty = rows.first['SyncDirty'];
@@ -550,6 +599,9 @@ class SyncService {
       localDeviceId: await _ensureDeviceId(),
       remoteDeviceId: remoteDeviceId,
       remoteDeleted: remoteDeleted,
+      localServerRev: SyncMeta.asServerRev(rows.first['ServerRev']),
+      remoteServerRev: remoteServerRev,
+      forceAuthoritative: _forceAuthoritativeApply,
     );
   }
 
@@ -571,6 +623,7 @@ class SyncService {
       updated,
       remoteDeleted: remoteDeleted,
       remoteDeviceId: remoteDeviceId,
+      remoteServerRev: SyncMeta.asServerRev(r['server_rev']),
     );
     if (d == RemoteApplyDecision.apply) return null;
     if (d == RemoteApplyDecision.skipStage) {
@@ -1053,6 +1106,10 @@ class SyncService {
       final syncId = r['SyncId']?.toString() ?? '';
       if (table.isEmpty || syncId.isEmpty) continue;
       final deletedAt = r['DeletedAt']?.toString() ?? SyncMeta.nowIso();
+      final expectedRev = SyncMeta.asServerRev(r['ExpectedServerRev']);
+      final requestId = (r['RequestId']?.toString().isNotEmpty == true)
+          ? r['RequestId'].toString()
+          : SyncMeta.tombstoneRequestId(table, syncId, deletedAt);
       try {
         final payload = {
           'sync_id': syncId,
@@ -1060,21 +1117,54 @@ class SyncService {
           'deleted_at': deletedAt,
           'device_id': deviceId,
         };
-        // Tombstones: expected_rev unknown locally — null then OCC learn/retry inside _upsertAck.
-        final ack = await _upsertAck(table, payload);
+        // OCC: use stored base revision when known. Never invent/learn a newer rev to overwrite.
+        final ack = await _upsertAck(
+          table,
+          payload,
+          expectedServerRev: expectedRev,
+          requestId: requestId,
+        );
         if (ack == UploadAck.accepted ||
             ack == UploadAck.duplicate ||
             ack == UploadAck.deleted) {
-          await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
+          // Clear only the exact delete operation version that was acknowledged.
+          await db.delete(
+            'SyncTombstone',
+            where: 'SyncId = ? AND DeletedAt = ?',
+            whereArgs: [syncId, deletedAt],
+          );
         } else if (ack == UploadAck.conflict) {
+          // Legacy missing base rev OR concurrent edit: check deletion evidence only.
+          // Do NOT fetch a newer revision and blind-retry the delete.
           try {
-            final raw = await _table(table).select('deleted_at').eq('sync_id', syncId).limit(1).timeout(_httpTimeout);
+            final raw = await _table(table)
+                .select('deleted_at,server_rev')
+                .eq('sync_id', syncId)
+                .limit(1)
+                .timeout(_httpTimeout);
             if (raw.isNotEmpty && raw.first['deleted_at'] != null) {
-              await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
+              await db.delete(
+                'SyncTombstone',
+                where: 'SyncId = ? AND DeletedAt = ?',
+                whereArgs: [syncId, deletedAt],
+              );
+            } else {
+              await _logFail(
+                'push:tombstone:conflict:$table',
+                syncId,
+                expectedRev == null
+                    ? 'legacy tombstone missing ExpectedServerRev — retain delete intent; needs explicit resolution'
+                    : 'delete conflict (rev_mismatch) — retain tombstone; do not overwrite cloud',
+              );
+              if (raw.isNotEmpty) {
+                await _stageRemote(db, table, Map<String, dynamic>.from(raw.first));
+              }
             }
-          } catch (_) {}
+          } catch (e) {
+            await _logFail('push:tombstone:conflict-check:$table', syncId, e);
+          }
         }
-        // unknown/failure: keep tombstone durable for retry
+        // unknown/failure: keep tombstone durable for retry with same request_id
       } catch (e) {
         await _logFail('push:tombstone:$table', syncId, e);
       }

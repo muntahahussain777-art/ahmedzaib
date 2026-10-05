@@ -109,6 +109,9 @@ class SyncPolicy {
     required String? localDeviceId,
     required String? remoteDeviceId,
     required bool remoteDeleted,
+    int? localServerRev,
+    int? remoteServerRev,
+    bool forceAuthoritative = false,
   }) {
     return classifyRemoteApply(
           rowExists: rowExists,
@@ -119,6 +122,9 @@ class SyncPolicy {
           localDeviceId: localDeviceId,
           remoteDeviceId: remoteDeviceId,
           remoteDeleted: remoteDeleted,
+          localServerRev: localServerRev,
+          remoteServerRev: remoteServerRev,
+          forceAuthoritative: forceAuthoritative,
         ) ==
         RemoteApplyDecision.apply;
   }
@@ -132,22 +138,44 @@ class SyncPolicy {
     required String? localDeviceId,
     required String? remoteDeviceId,
     required bool remoteDeleted,
+    int? localServerRev,
+    int? remoteServerRev,
+    bool forceAuthoritative = false,
   }) {
     if (hasLocalTombstone) {
       // Keep tombstone until push ack; never resurrect from live row.
       return remoteDeleted ? RemoteApplyDecision.apply : RemoteApplyDecision.skipStage;
     }
-    if (syncDirty) return RemoteApplyDecision.skipStage;
+    if (!forceAuthoritative && syncDirty) return RemoteApplyDecision.skipStage;
 
     if (!rowExists) return RemoteApplyDecision.apply;
 
+    // Authoritative conflict adoption bypasses timestamp/device veto.
+    if (forceAuthoritative) return RemoteApplyDecision.apply;
+
+    final remoteRev = (remoteServerRev != null && remoteServerRev > 0) ? remoteServerRev : null;
+    final localRev = (localServerRev != null && localServerRev > 0) ? localServerRev : null;
+
+    // Trusted publication revisions: device timestamps must not veto a newer server_rev.
+    if (remoteRev != null) {
+      if (localRev != null) {
+        if (remoteRev > localRev) return RemoteApplyDecision.apply;
+        if (remoteRev < localRev) return RemoteApplyDecision.skipDone;
+        // Equal rev: already at this publication; apply only soft-delete.
+        return remoteDeleted ? RemoteApplyDecision.apply : RemoteApplyDecision.skipDone;
+      }
+      // Local missing trusted rev, remote has one — apply authoritative cloud.
+      return RemoteApplyDecision.apply;
+    }
+
+    // Legacy path (no trusted remote rev): timestamp / device tie-break.
+    // Do not treat local timestamp superiority as proof against an unknown cloud rev.
     final local = parseTs(localUpdatedAt);
     final remote = parseTs(remoteUpdatedAt);
     final cmp = remote.compareTo(local);
     if (cmp > 0) return RemoteApplyDecision.apply;
     if (cmp < 0) return RemoteApplyDecision.skipDone;
 
-    // Equal timestamps: delete wins; else higher device_id wins (deterministic).
     if (remoteDeleted) return RemoteApplyDecision.apply;
     final ld = localDeviceId ?? '';
     final rd = remoteDeviceId ?? '';
@@ -158,7 +186,13 @@ class SyncPolicy {
   static ConflictReconcile reconcileRejectedUpload({
     required String? localUpdatedAtNow,
     required String? rejectedUploadedUpdatedAt,
+    bool hasLocalTombstone = false,
+    bool serverDeleted = false,
   }) {
+    // Pending local delete wins over adopting a live server row.
+    if (hasLocalTombstone && !serverDeleted) {
+      return ConflictReconcile.keepLocalDirtyStageServer;
+    }
     if (rejectedUploadedUpdatedAt == null || rejectedUploadedUpdatedAt.isEmpty) {
       return ConflictReconcile.keepLocalDirtyStageServer;
     }
@@ -169,6 +203,21 @@ class SyncPolicy {
       return ConflictReconcile.adoptServerClearDirty;
     }
     return ConflictReconcile.keepLocalDirtyStageServer;
+  }
+
+  /// Clear tombstone only for the exact delete operation version that was acked.
+  static bool shouldClearTombstone({
+    required String? tombstoneDeletedAt,
+    required String? acknowledgedDeletedAt,
+  }) {
+    if (tombstoneDeletedAt == null || tombstoneDeletedAt.isEmpty) return false;
+    if (acknowledgedDeletedAt == null || acknowledgedDeletedAt.isEmpty) return false;
+    return parseTs(tombstoneDeletedAt).isAtSameMomentAs(parseTs(acknowledgedDeletedAt));
+  }
+
+  /// Legacy tombstones without ExpectedServerRev: never invent a base revision.
+  static bool tombstoneMayUploadWithoutExpectedRev(int? expectedServerRev) {
+    return expectedServerRev == null || expectedServerRev <= 0;
   }
 
   /// Composite pull cursor: updated_at + sync_id (timestamp alone is insufficient).

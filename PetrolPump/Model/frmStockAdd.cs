@@ -475,6 +475,11 @@ namespace ZaibPetroleumService.Model
                             decimal delRate = Convert.ToDecimal(old["Rate"]);
                             decimal delAdd = Convert.ToDecimal(old["AddDisel"]);
                             string syncId = old.Table.Columns.Contains("SyncId") ? old["SyncId"]?.ToString() : null;
+                            long? expectedRev = null;
+                            if (old.Table.Columns.Contains("ServerRev") && old["ServerRev"] != DBNull.Value)
+                            {
+                                try { long v = Convert.ToInt64(old["ServerRev"]); if (v > 0) expectedRev = v; } catch { }
+                            }
                             decimal ddAmountToSubtract = delRate * delAdd;
 
                             if (MainClass.ExecInTx(
@@ -483,7 +488,7 @@ namespace ZaibPetroleumService.Model
                                     conn, tx) <= 0)
                                 return false;
 
-                            LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_purchases", conn, tx);
+                            LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_purchases", conn, tx, expectedRev);
 
                             if (delDealerId > 0 && ddAmountToSubtract != 0)
                             {

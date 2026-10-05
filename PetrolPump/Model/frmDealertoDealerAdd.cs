@@ -457,6 +457,11 @@ namespace ZaibPetroleumService.Model
                             DataRow row = LocalPersistence.ReadRow("DealertoDealer", "LedgerID", LedgerID, conn, tx);
                             if (row == null) return false;
                             string syncId = row.Table.Columns.Contains("SyncId") ? Convert.ToString(row["SyncId"]) : null;
+                            long? expectedRev = null;
+                            if (row.Table.Columns.Contains("ServerRev") && row["ServerRev"] != DBNull.Value)
+                            {
+                                try { long v = Convert.ToInt64(row["ServerRev"]); if (v > 0) expectedRev = v; } catch { }
+                            }
                             int d1 = row["id"] != DBNull.Value ? Convert.ToInt32(row["id"]) : 0;
                             int d2 = row["Did"] != DBNull.Value ? Convert.ToInt32(row["Did"]) : 0;
                             decimal amt = row["AmounGiven"] != DBNull.Value ? Convert.ToDecimal(row["AmounGiven"]) : 0;
@@ -465,7 +470,7 @@ namespace ZaibPetroleumService.Model
                             {
                                 SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId + ":from");
                                 SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId + ":to");
-                                LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_transfers", conn, tx);
+                                LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_transfers", conn, tx, expectedRev);
                             }
                             return MainClass.ExecInTx(
                                 "DELETE FROM DealertoDealer WHERE LedgerID = @LedgerID",

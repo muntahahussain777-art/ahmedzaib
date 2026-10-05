@@ -147,4 +147,91 @@ void main() {
       );
     });
   });
+
+  group('SyncPolicy server_rev + tombstone OCC', () {
+    test('newer remote server_rev applies even when local timestamp is later', () {
+      expect(
+        SyncPolicy.shouldApplyRemote(
+          rowExists: true,
+          syncDirty: false,
+          hasLocalTombstone: false,
+          localUpdatedAt: '2026-12-01T00:00:00.000Z',
+          remoteUpdatedAt: '2026-01-01T00:00:00.000Z',
+          localDeviceId: 'a',
+          remoteDeviceId: 'b',
+          remoteDeleted: false,
+          localServerRev: 10,
+          remoteServerRev: 20,
+        ),
+        isTrue,
+      );
+    });
+
+    test('older remote server_rev does not overwrite', () {
+      expect(
+        SyncPolicy.shouldApplyRemote(
+          rowExists: true,
+          syncDirty: false,
+          hasLocalTombstone: false,
+          localUpdatedAt: '2026-01-01T00:00:00.000Z',
+          remoteUpdatedAt: '2026-12-01T00:00:00.000Z',
+          localDeviceId: 'a',
+          remoteDeviceId: 'b',
+          remoteDeleted: false,
+          localServerRev: 20,
+          remoteServerRev: 10,
+        ),
+        isFalse,
+      );
+    });
+
+    test('forceAuthoritative applies despite dirty and older timestamp', () {
+      expect(
+        SyncPolicy.shouldApplyRemote(
+          rowExists: true,
+          syncDirty: true,
+          hasLocalTombstone: false,
+          localUpdatedAt: '2026-12-01T00:00:00.000Z',
+          remoteUpdatedAt: '2026-01-01T00:00:00.000Z',
+          localDeviceId: 'a',
+          remoteDeviceId: 'b',
+          remoteDeleted: false,
+          localServerRev: 5,
+          remoteServerRev: 5,
+          forceAuthoritative: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('adopt blocked when tombstone pending and server live', () {
+      expect(
+        SyncPolicy.reconcileRejectedUpload(
+          localUpdatedAtNow: '2026-06-01T12:00:00.000Z',
+          rejectedUploadedUpdatedAt: '2026-06-01T12:00:00.000Z',
+          hasLocalTombstone: true,
+          serverDeleted: false,
+        ),
+        ConflictReconcile.keepLocalDirtyStageServer,
+      );
+    });
+
+    test('clear tombstone only for exact delete version', () {
+      const v = '2026-06-01T12:00:00.000Z';
+      expect(
+        SyncPolicy.shouldClearTombstone(
+          tombstoneDeletedAt: v,
+          acknowledgedDeletedAt: v,
+        ),
+        isTrue,
+      );
+      expect(
+        SyncPolicy.shouldClearTombstone(
+          tombstoneDeletedAt: v,
+          acknowledgedDeletedAt: '2026-06-01T12:00:01.000Z',
+        ),
+        isFalse,
+      );
+    });
+  });
 }

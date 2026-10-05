@@ -19,6 +19,24 @@ class SyncMeta {
 
   static String nowIso() => DateTime.now().toUtc().toIso8601String();
 
+  /// Stable delete operation request id (immutable across retries).
+  static String tombstoneRequestId(String cloudTable, String syncId, String deletedAt) =>
+      uuid.v5(Namespace.url.value, '$cloudTable|$syncId|$deletedAt|del');
+
+  static int? asServerRev(Object? v) {
+    if (v == null) return null;
+    int? i;
+    if (v is int) {
+      i = v;
+    } else if (v is num) {
+      i = v.toInt();
+    } else {
+      i = int.tryParse(v.toString());
+    }
+    if (i == null || i <= 0) return null;
+    return i;
+  }
+
   static void stampNew(Map<String, Object?> map) {
     map['SyncId'] ??= newId();
     map['UpdatedAt'] = nowIso();

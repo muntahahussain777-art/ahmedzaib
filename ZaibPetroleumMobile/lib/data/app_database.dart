@@ -134,13 +134,47 @@ class AppDatabase {
     _syncBackfillDone = true;
   }
 
-  Future<void> _tombstone(String cloudTable, String? syncId, [DatabaseExecutor? executor]) async {
+  Future<void> _tombstone(
+    String cloudTable,
+    String? syncId, {
+    int? expectedServerRev,
+    DatabaseExecutor? executor,
+  }) async {
     if (syncId == null || syncId.isEmpty) return;
     final db = executor ?? await database;
+    final deletedAt = SyncMeta.nowIso();
+    final reqId = SyncMeta.tombstoneRequestId(cloudTable, syncId, deletedAt);
     await db.insert(
       'SyncTombstone',
-      {'SyncId': syncId, 'CloudTable': cloudTable, 'DeletedAt': SyncMeta.nowIso()},
+      {
+        'SyncId': syncId,
+        'CloudTable': cloudTable,
+        'DeletedAt': deletedAt,
+        'ExpectedServerRev': expectedServerRev,
+        'RequestId': reqId,
+      },
       conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<({String? syncId, int? serverRev})> _readSyncMeta(
+    String table,
+    String pkCol,
+    Object id, [
+    DatabaseExecutor? executor,
+  ]) async {
+    final db = executor ?? await database;
+    final rows = await db.query(
+      table,
+      columns: ['SyncId', 'ServerRev'],
+      where: '$pkCol = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (rows.isEmpty) return (syncId: null, serverRev: null);
+    return (
+      syncId: rows.first['SyncId']?.toString(),
+      serverRev: SyncMeta.asServerRev(rows.first['ServerRev']),
     );
   }
 
@@ -223,8 +257,8 @@ class AppDatabase {
       final used = (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM PetrolAdd WHERE CustomerId = ?', [id])) ?? 0) +
           (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE CustomerId = ?', [id])) ?? 0);
       if (used > 0) throw Exception('Ye customer use ho raha hai — delete nahi ho sakta.');
-      final syncId = await _readSyncId('AddCustomer', 'id', id, txn);
-      await _tombstone('zaib_customers', syncId, txn);
+      final meta = await _readSyncMeta('AddCustomer', 'id', id, txn);
+      await _tombstone('zaib_customers', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('AddCustomer', where: 'id = ?', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -364,8 +398,8 @@ class AppDatabase {
 
   Future<int> deleteSale(int id) async {
     return _runLocalWrite((txn) async {
-      final syncId = await _readSyncId('PetrolAdd', 'pid', id, txn);
-      await _tombstone('zaib_petrol_entries', syncId, txn);
+      final meta = await _readSyncMeta('PetrolAdd', 'pid', id, txn);
+      await _tombstone('zaib_petrol_entries', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('PetrolAdd', where: 'pid = ?', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -419,8 +453,8 @@ class AppDatabase {
 
   Future<int> deleteCredit(int id) async {
     return _runLocalWrite((txn) async {
-      final syncId = await _readSyncId('PetrolAdd', 'pid', id, txn);
-      await _tombstone('zaib_petrol_entries', syncId, txn);
+      final meta = await _readSyncMeta('PetrolAdd', 'pid', id, txn);
+      await _tombstone('zaib_petrol_entries', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('PetrolAdd', where: 'pid = ? AND IFNULL(IsInitialEntry,0) = 0', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -561,8 +595,8 @@ class AppDatabase {
           (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM StockDiesel WHERE SDid = ?', [id])) ?? 0) +
           (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE DealerId = ?', [id])) ?? 0);
       if (used > 0) throw Exception('Ye dealer use ho raha hai — delete nahi ho sakta.');
-      final syncId = await _readSyncId('AddDealer', 'Did', id, txn);
-      await _tombstone('zaib_dealers', syncId, txn);
+      final meta = await _readSyncMeta('AddDealer', 'Did', id, txn);
+      await _tombstone('zaib_dealers', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('AddDealer', where: 'Did = ?', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -648,10 +682,12 @@ class AppDatabase {
       final auth = await _readRow('DieselLedgerCredit', 'LedgerID', p.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
       final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
       if (syncId.isNotEmpty) {
         await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
       }
-      await _tombstone('zaib_dealer_payouts', syncId.isEmpty ? null : syncId, txn);
+      await _tombstone('zaib_dealer_payouts', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
       final n = await txn.delete('DieselLedgerCredit', where: 'LedgerID = ?', whereArgs: [p.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -715,10 +751,12 @@ class AppDatabase {
       final auth = await _readRow('AddStock', 'Sid', e.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
       final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
       if (syncId.isNotEmpty) {
         await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
       }
-      await _tombstone('zaib_dealer_purchases', syncId.isEmpty ? null : syncId, txn);
+      await _tombstone('zaib_dealer_purchases', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
       final n = await txn.delete('AddStock', where: 'Sid = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -796,10 +834,12 @@ class AppDatabase {
       final auth = await _readRow('DieselLedgerDebit', 'LedgerID', e.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
       final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
       if (syncId.isNotEmpty) {
         await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
       }
-      await _tombstone('zaib_dealer_direct', syncId.isEmpty ? null : syncId, txn);
+      await _tombstone('zaib_dealer_direct', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
       final n = await txn.delete('DieselLedgerDebit', where: 'LedgerID = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -834,8 +874,8 @@ class AppDatabase {
 
   Future<int> deleteStock(int id) async {
     return _runLocalWrite((txn) async {
-      final syncId = await _readSyncId('StockDiesel', 'SID', id, txn);
-      await _tombstone('zaib_stock_diesel', syncId, txn);
+      final meta = await _readSyncMeta('StockDiesel', 'SID', id, txn);
+      await _tombstone('zaib_stock_diesel', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('StockDiesel', where: 'SID = ?', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -870,8 +910,8 @@ class AppDatabase {
 
   Future<int> deleteBank(int id) async {
     return _runLocalWrite((txn) async {
-      final syncId = await _readSyncId('BankTransactions', 'Id', id, txn);
-      await _tombstone('zaib_bank_transactions', syncId, txn);
+      final meta = await _readSyncMeta('BankTransactions', 'Id', id, txn);
+      await _tombstone('zaib_bank_transactions', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
       final n = await txn.delete('BankTransactions', where: 'Id = ?', whereArgs: [id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;

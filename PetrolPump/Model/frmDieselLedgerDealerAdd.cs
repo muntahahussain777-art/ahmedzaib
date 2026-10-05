@@ -434,6 +434,11 @@ namespace ZaibPetroleumService.Model
                         int dealerId = Convert.ToInt32(old["Did"]);
                         decimal amountToDelete = Convert.ToDecimal(old["AmounGiven"]);
                         string syncId = old.Table.Columns.Contains("SyncId") ? old["SyncId"]?.ToString() : null;
+                        long? expectedRev = null;
+                        if (old.Table.Columns.Contains("ServerRev") && old["ServerRev"] != DBNull.Value)
+                        {
+                            try { long v = Convert.ToInt64(old["ServerRev"]); if (v > 0) expectedRev = v; } catch { }
+                        }
 
                         if (MainClass.ExecInTx(
                                 "DELETE FROM DieselLedgerCredit WHERE LedgerID = @LedgerID",
@@ -441,7 +446,7 @@ namespace ZaibPetroleumService.Model
                                 conn, tx) <= 0)
                             return false;
 
-                        LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_payouts", conn, tx);
+                        LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_payouts", conn, tx, expectedRev);
 
                         if (dealerId > 0 && amountToDelete != 0)
                         {
