@@ -21,14 +21,16 @@ class DealerListScreen extends StatefulWidget {
 class _DealerListScreenState extends State<DealerListScreen> {
   final _search = TextEditingController();
   List<Dealer> _items = [];
+  List<String> _nameSuggestions = [];
   DealerLedgerSummary? _totals;
   String? _matchedName;
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -37,8 +39,11 @@ class _DealerListScreenState extends State<DealerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  Future<void> _load({bool showSpinner = false}) async {
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
+    final allDealers = await AppDatabase.instance.getDealers();
     final rows = await AppDatabase.instance.getDealers(query: _search.text);
     final matched = await AppDatabase.instance.findDealerByExactName(_search.text);
     final byName = matched?.id == null ? null : await AppDatabase.instance.getDealerLedgerSummary(matched!.id!);
@@ -48,7 +53,9 @@ class _DealerListScreenState extends State<DealerListScreen> {
       _items = rows;
       _totals = totals;
       _matchedName = matched?.name;
+      _nameSuggestions = allDealers.map((d) => d.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
@@ -57,7 +64,7 @@ class _DealerListScreenState extends State<DealerListScreen> {
       context,
       MaterialPageRoute(builder: (_) => DealerFormScreen(dealer: item)),
     );
-    if (ok == true) _load();
+    if (ok == true) _load(showSpinner: true);
   }
 
   @override
@@ -81,13 +88,11 @@ class _DealerListScreenState extends State<DealerListScreen> {
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-            child: TextField(
+            child: VipSuggestSearchField(
               controller: _search,
-              onChanged: (_) => _load(),
-              decoration: const InputDecoration(
-                hintText: 'Search dealer',
-                prefixIcon: Icon(Icons.search, color: AppColors.gold),
-              ),
+              suggestions: _nameSuggestions,
+              hint: 'Dealer name type / suggest',
+              onQueryChanged: (_) => _load(showSpinner: false),
             ),
           ),
           Expanded(
@@ -107,7 +112,7 @@ class _DealerListScreenState extends State<DealerListScreen> {
                               if (!await confirmDelete(context, '${d.name} delete?')) return;
                               try {
                                 await AppDatabase.instance.deleteDealer(d.id!);
-                                _load();
+                                _load(showSpinner: true);
                               } catch (e) {
                                 if (!context.mounted) return;
                                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));

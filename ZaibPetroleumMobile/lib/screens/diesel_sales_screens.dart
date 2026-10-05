@@ -22,15 +22,17 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
   final _from = TextEditingController();
   final _to = TextEditingController();
   List<DieselSale> _items = [];
+  List<String> _nameSuggestions = [];
   CustomerLedgerSummary? _totals;
   LitterRateAvgSummary? _avg;
   String? _matchedCustomerName;
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -41,8 +43,10 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  Future<void> _load({bool showSpinner = false}) async {
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
     final from = _from.text.trim();
     final to = _to.text.trim();
     final rows = await AppDatabase.instance.getSales(
@@ -54,13 +58,16 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
     final matched = await AppDatabase.instance.findCustomerByExactName(_search.text);
     final totals = byName ?? await AppDatabase.instance.getGlobalCustomerLedger();
     final avg = LitterRateAvgSummary.fromDiesel(rows);
+    final customers = await AppDatabase.instance.getCustomers();
     if (!mounted) return;
     setState(() {
       _items = rows;
       _totals = totals;
       _avg = avg;
       _matchedCustomerName = matched?.name;
+      _nameSuggestions = customers.map((c) => c.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
@@ -69,7 +76,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
       context,
       MaterialPageRoute(builder: (_) => DieselSaleFormScreen(sale: sale)),
     );
-    if (changed == true) _load();
+    if (changed == true) _load(showSpinner: true);
   }
 
   Future<void> _delete(DieselSale s) async {
@@ -88,7 +95,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
     if (ok != true || s.id == null) return;
     await AppDatabase.instance.deleteSale(s.id!);
     if (!mounted) return;
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -122,13 +129,11 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Column(
               children: [
-                TextField(
+                VipSuggestSearchField(
                   controller: _search,
-                  onChanged: (_) => _load(),
-                  decoration: const InputDecoration(
-                    hintText: 'Search customer / vehicle / receipt',
-                    prefixIcon: Icon(Icons.search, color: AppColors.gold),
-                  ),
+                  suggestions: _nameSuggestions,
+                  hint: 'Customer name type / suggest',
+                  onQueryChanged: (_) => _load(showSpinner: false),
                 ),
                 const SizedBox(height: 8),
                 Row(
@@ -140,7 +145,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
                         readOnly: true,
                         onTap: () async {
                           await pickVipDate(context, _from);
-                          _load();
+                          _load(showSpinner: true);
                         },
                         suffix: const Icon(Icons.calendar_month, color: AppColors.gold),
                       ),
@@ -153,7 +158,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
                         readOnly: true,
                         onTap: () async {
                           await pickVipDate(context, _to);
-                          _load();
+                          _load(showSpinner: true);
                         },
                         suffix: const Icon(Icons.calendar_month, color: AppColors.gold),
                       ),

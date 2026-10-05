@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -277,6 +279,138 @@ class _VipSearchDropdownState<T extends Object> extends State<VipSearchDropdown<
           );
         },
       ),
+    );
+  }
+}
+
+/// List-screen search with name suggestions.
+/// Debounced callback — typing se keyboard hide nahi hoti (parent soft reload).
+class VipSuggestSearchField extends StatefulWidget {
+  const VipSuggestSearchField({
+    super.key,
+    required this.controller,
+    required this.suggestions,
+    required this.onQueryChanged,
+    this.hint = 'Name type / suggest',
+    this.debounce = const Duration(milliseconds: 350),
+  });
+
+  final TextEditingController controller;
+  final List<String> suggestions;
+  final ValueChanged<String> onQueryChanged;
+  final String hint;
+  final Duration debounce;
+
+  @override
+  State<VipSuggestSearchField> createState() => _VipSuggestSearchFieldState();
+}
+
+class _VipSuggestSearchFieldState extends State<VipSuggestSearchField> {
+  final FocusNode _focus = FocusNode();
+  Timer? _timer;
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _emitDebounced(String text) {
+    _timer?.cancel();
+    _timer = Timer(widget.debounce, () {
+      if (!mounted) return;
+      widget.onQueryChanged(text);
+    });
+  }
+
+  Iterable<String> _filter(String q) {
+    final query = q.trim().toLowerCase();
+    if (query.isEmpty) return const Iterable<String>.empty();
+    final matched = widget.suggestions
+        .where((e) => e.toLowerCase().contains(query))
+        .toList();
+    matched.sort((a, b) {
+      final an = a.toLowerCase();
+      final bn = b.toLowerCase();
+      final ae = an == query ? 0 : (an.startsWith(query) ? 1 : 2);
+      final be = bn == query ? 0 : (bn.startsWith(query) ? 1 : 2);
+      if (ae != be) return ae.compareTo(be);
+      return an.compareTo(bn);
+    });
+    return matched.take(12);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RawAutocomplete<String>(
+      textEditingController: widget.controller,
+      focusNode: _focus,
+      optionsBuilder: (value) => _filter(value.text),
+      onSelected: (name) {
+        widget.controller.text = name;
+        widget.controller.selection = TextSelection.collapsed(offset: name.length);
+        _timer?.cancel();
+        widget.onQueryChanged(name);
+      },
+      fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+        return TextField(
+          controller: controller,
+          focusNode: focusNode,
+          style: const TextStyle(color: AppColors.cream),
+          decoration: InputDecoration(
+            hintText: widget.hint,
+            prefixIcon: const Icon(Icons.search, color: AppColors.gold),
+            suffixIcon: controller.text.isEmpty
+                ? null
+                : IconButton(
+                    icon: const Icon(Icons.clear, color: AppColors.muted, size: 18),
+                    onPressed: () {
+                      controller.clear();
+                      _timer?.cancel();
+                      widget.onQueryChanged('');
+                      setState(() {});
+                    },
+                  ),
+          ),
+          onChanged: (v) {
+            setState(() {});
+            _emitDebounced(v);
+          },
+          onSubmitted: (v) {
+            _timer?.cancel();
+            widget.onQueryChanged(v);
+          },
+        );
+      },
+      optionsViewBuilder: (context, onSelected, options) {
+        final list = options.toList();
+        if (list.isEmpty) return const SizedBox.shrink();
+        return Align(
+          alignment: Alignment.topLeft,
+          child: Material(
+            color: AppColors.panel,
+            elevation: 6,
+            borderRadius: BorderRadius.circular(12),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 220, minWidth: 280),
+              child: ListView.builder(
+                padding: EdgeInsets.zero,
+                shrinkWrap: true,
+                itemCount: list.length,
+                itemBuilder: (context, i) {
+                  final name = list[i];
+                  return ListTile(
+                    dense: true,
+                    title: Text(name, style: const TextStyle(color: AppColors.cream)),
+                    onTap: () => onSelected(name),
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

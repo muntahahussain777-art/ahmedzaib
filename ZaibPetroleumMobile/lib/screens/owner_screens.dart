@@ -227,8 +227,8 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  Future<void> _load({bool showSpinner = true}) async {
+    if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final veh = (_vehicleSelected ?? _vehicleText.text).trim();
       final rows = await AppDatabase.instance.ownerCustomerLedger(
@@ -263,7 +263,7 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
         _vehicleText.clear();
       }
     });
-    await _load();
+    await _load(showSpinner: false);
   }
 
   Future<void> _exportPdf() async {
@@ -319,7 +319,7 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
                       _vehicleSelected = v;
                       _vehicleText.text = v ?? '';
                     });
-                    _load();
+                    _load(showSpinner: false);
                   },
                 ),
                 Row(
@@ -355,7 +355,7 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
                   children: [
                     Expanded(
                       child: ElevatedButton.icon(
-                        onPressed: _load,
+                        onPressed: () => _load(),
                         icon: const Icon(Icons.search),
                         label: const Text('Search'),
                       ),
@@ -449,8 +449,8 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  Future<void> _load({bool showSpinner = true}) async {
+    if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final veh = (_vehicleSelected ?? _vehicleText.text).trim();
       final rows = await AppDatabase.instance.ownerDealerLedger(
@@ -485,7 +485,7 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
         _vehicleText.clear();
       }
     });
-    await _load();
+    await _load(showSpinner: false);
   }
 
   Future<void> _exportPdf() async {
@@ -541,7 +541,7 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
                       _vehicleSelected = v;
                       _vehicleText.text = v ?? '';
                     });
-                    _load();
+                    _load(showSpinner: false);
                   },
                 ),
                 Row(
@@ -577,7 +577,7 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
                   children: [
                     Expanded(
                       child: ElevatedButton.icon(
-                        onPressed: _load,
+                        onPressed: () => _load(),
                         icon: const Icon(Icons.search),
                         label: const Text('Search'),
                       ),
