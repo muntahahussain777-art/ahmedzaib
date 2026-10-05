@@ -187,12 +187,47 @@ class SyncPolicy {
     return (cursor.substring(0, i), cursor.substring(i + 1));
   }
 
-  static bool cursorLessOrEqual(String updatedAt, String syncId, String cursorUpdated, String cursorSync) {
-    final cmp = parseTs(updatedAt).compareTo(parseTs(cursorUpdated));
+  /// Contiguous watermark for BIGSERIAL change feeds.
+  /// Concurrent transactions may commit out of ID order; only advance through
+  /// contiguous IDs so a late commit with a lower ID is not skipped forever.
+  static int advanceContiguousWatermark({
+    required int cursor,
+    required Iterable<int> seenIds,
+  }) {
+    final sorted = seenIds.where((id) => id > cursor).toSet().toList()..sort();
+    var next = cursor;
+    for (final id in sorted) {
+      if (id == next + 1) {
+        next = id;
+      } else if (id > next + 1) {
+        break;
+      }
+    }
+    return next;
+  }
+
+  static String encodeChangeCursor(int changeId) => 'chg:$changeId';
+
+  static int decodeChangeCursor(String? raw) {
+    if (raw == null || raw.isEmpty) return 0;
+    if (raw.startsWith('chg:')) {
+      return int.tryParse(raw.substring(4)) ?? 0;
+    }
+    // Legacy timestamp cursor — treated as "needs bootstrap", not a change id.
+    return -1;
+  }
+
+  /// Whether composite pull cursor (updatedAt, syncId) is at or before (at2, id2).
+  static bool cursorLessOrEqual(String at1, String id1, String at2, String id2) {
+    final cmp = parseTs(at1).compareTo(parseTs(at2));
     if (cmp < 0) return true;
     if (cmp > 0) return false;
-    return syncId.compareTo(cursorSync) <= 0;
+    return id1.compareTo(id2) <= 0;
   }
+
+  /// Staged remote rows are dropped after apply or when safely skipped.
+  static bool shouldRemoveStagedRemote(RemoteApplyResult result) =>
+      result == RemoteApplyResult.applied || result == RemoteApplyResult.safelyAlreadyHandled;
 }
 
 enum UploadAck { accepted, duplicate, conflict, failure }
@@ -204,6 +239,16 @@ enum RemoteApplyDecision {
   skipStage,
   /// Do not apply; safe to forget (older / lost tie-break).
   skipDone,
+}
+
+/// Explicit outcome of a remote apply attempt (staging lifecycle).
+enum RemoteApplyResult {
+  /// Row/balances/markers committed successfully.
+  applied,
+  /// Older/duplicate remote; safe to drop staging and advance.
+  safelyAlreadyHandled,
+  /// Blocked (missing parent / pending local); staging must be retained.
+  stagedForRetry,
 }
 
 enum ConflictReconcile {

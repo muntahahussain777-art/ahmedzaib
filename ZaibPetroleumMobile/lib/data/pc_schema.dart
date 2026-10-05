@@ -115,6 +115,19 @@ class PcSchema {
         Note TEXT
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS DealertoDealer (
+        LedgerID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Date TEXT,
+        FirstDealer INTEGER,
+        SecondDealer INTEGER,
+        AmounGiven REAL,
+        Note TEXT,
+        id INTEGER,
+        Did INTEGER
+      )
+    ''');
   }
 
   static Future<void> ensure(Database db) async {
@@ -138,6 +151,7 @@ class PcSchema {
       'StockDiesel',
       'BankTransactions',
       'Expensetable',
+      'DealertoDealer',
     ];
     for (final t in syncTables) {
       await _ensureColumn(db, t, 'SyncId', 'TEXT');

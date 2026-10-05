@@ -216,30 +216,78 @@ namespace ZaibPetroleumService.Model
             {
                 if (LedgerID == 0)
                 {
-                    // =========== NEW RECORD ===========
-                    InsertLedgerRecord(newDealerId1, newDealerId2, newDealerName1, newDealerName2, newAmountPaid, txtNote.Text, paymentDate);
-
-                    // Ab new dealers mein amount add karo
-                    AddToDealer1(newDealerId1, newAmountPaid);
-                    AddToDealer2(newDealerId2, newAmountPaid);
-
+                    bool ok = MainClass.RunInTransaction((conn, tx) =>
+                    {
+                        string insertSql = @"
+                INSERT INTO DealertoDealer
+                    (Date, FirstDealer, SecondDealer, AmounGiven, Note, id, Did)
+                VALUES
+                    (@payDate, @name1, @name2, @amt, @note, @d1, @d2)";
+                        var ht = new Hashtable
+                        {
+                            { "@payDate", paymentDate.ToString("yyyy-MM-dd") },
+                            { "@name1", newDealerName1 },
+                            { "@name2", newDealerName2 },
+                            { "@amt", newAmountPaid },
+                            { "@note", txtNote.Text ?? "" },
+                            { "@d1", newDealerId1 },
+                            { "@d2", newDealerId2 }
+                        };
+                        if (MainClass.ExecInTx(insertSql, ht, conn, tx) <= 0) return false;
+                        long lid = Convert.ToInt64(LocalPersistence.Scalar("SELECT last_insert_rowid()", null, conn, tx));
+                        if (!AdjustDealerBalancesInTx(conn, tx, newDealerId1, newDealerId2, newAmountPaid, newAmountPaid)) return false;
+                        DataRow row = LocalPersistence.ReadRow("DealertoDealer", "LedgerID", lid, conn, tx);
+                        if (row == null) return false;
+                        string syncId = row.Table.Columns.Contains("SyncId") ? Convert.ToString(row["SyncId"]) : null;
+                        if (string.IsNullOrWhiteSpace(syncId)) return false;
+                        SupabaseSyncService.RecordLocalDealerTransferBalanceEffect(conn, tx, syncId, newDealerId1, newDealerId2, (double)newAmountPaid);
+                        return true;
+                    });
+                    if (!ok)
+                    {
+                        ErrorFormMessage err = new ErrorFormMessage("نیا ریکارڈ محفوظ نہیں ہو سکا۔", "Error");
+                        err.ShowDialog();
+                        return;
+                    }
                     CustomeMessage successMessage = new CustomeMessage("نیا ریکارڈ سیو ہو گیا!", "Success");
                     successMessage.ShowDialog();
                 }
                 else
                 {
-                    // =========== EDIT MODE ===========
-                    // 1) Undo the old scenario
-                    if (_oldDealerId1 != 0 && _oldAmountPaid != 0) SubtractFromDealer1(_oldDealerId1, _oldAmountPaid);
-                    if (_oldDealerId2 != 0 && _oldAmountPaid != 0) SubtractFromDealer2(_oldDealerId2, _oldAmountPaid);
-
-                    // 2) Update DealertoDealer record with the new info
-                    UpdateLedgerRecord(LedgerID, newDealerId1, newDealerId2, newDealerName1, newDealerName2, newAmountPaid, txtNote.Text, paymentDate);
-
-                    // 3) Add new scenario
-                    AddToDealer1(newDealerId1, newAmountPaid);
-                    AddToDealer2(newDealerId2, newAmountPaid);
-
+                    bool ok = MainClass.RunInTransaction((conn, tx) =>
+                    {
+                        if (!AdjustDealerBalancesInTx(conn, tx, _oldDealerId1, _oldDealerId2, -_oldAmountPaid, -_oldAmountPaid)) return false;
+                        string updateSql = @"
+                UPDATE DealertoDealer
+                SET Date = @payDate, FirstDealer = @name1, SecondDealer = @name2, AmounGiven = @amt,
+                    Note = @note, id = @d1, Did = @d2
+                WHERE LedgerID = @lid";
+                        var ht = new Hashtable
+                        {
+                            { "@lid", LedgerID },
+                            { "@payDate", paymentDate.ToString("yyyy-MM-dd") },
+                            { "@name1", newDealerName1 },
+                            { "@name2", newDealerName2 },
+                            { "@amt", newAmountPaid },
+                            { "@note", txtNote.Text ?? "" },
+                            { "@d1", newDealerId1 },
+                            { "@d2", newDealerId2 }
+                        };
+                        if (MainClass.ExecInTx(updateSql, ht, conn, tx) <= 0) return false;
+                        if (!AdjustDealerBalancesInTx(conn, tx, newDealerId1, newDealerId2, newAmountPaid, newAmountPaid)) return false;
+                        DataRow row = LocalPersistence.ReadRow("DealertoDealer", "LedgerID", LedgerID, conn, tx);
+                        if (row == null) return false;
+                        string syncId = row.Table.Columns.Contains("SyncId") ? Convert.ToString(row["SyncId"]) : null;
+                        if (string.IsNullOrWhiteSpace(syncId)) return false;
+                        SupabaseSyncService.RecordLocalDealerTransferBalanceEffect(conn, tx, syncId, newDealerId1, newDealerId2, (double)newAmountPaid);
+                        return true;
+                    });
+                    if (!ok)
+                    {
+                        ErrorFormMessage err = new ErrorFormMessage("ریکارڈ اپڈیٹ نہیں ہو سکا۔", "Error");
+                        err.ShowDialog();
+                        return;
+                    }
                     CustomeMessage successMessage = new CustomeMessage("ریکارڈ اپڈیٹ ہو گیا!", "Success");
                     successMessage.ShowDialog();
                 }
@@ -254,8 +302,25 @@ namespace ZaibPetroleumService.Model
             }
         }
 
+        private static bool AdjustDealerBalancesInTx(
+            System.Data.SQLite.SQLiteConnection conn, System.Data.SQLite.SQLiteTransaction tx,
+            int dealerId1, int dealerId2, decimal delta1, decimal delta2)
+        {
+            if (dealerId1 > 0 && delta1 != 0 &&
+                MainClass.ExecInTx(
+                    "UPDATE AddDealer SET DAmount = DAmount + @amt WHERE Did = @did",
+                    new Hashtable { { "@amt", delta1 }, { "@did", dealerId1 } }, conn, tx) <= 0)
+                return false;
+            if (dealerId2 > 0 && delta2 != 0 &&
+                MainClass.ExecInTx(
+                    "UPDATE AddDealer SET DDAmount = DDAmount + @amt WHERE Did = @did",
+                    new Hashtable { { "@amt", delta2 }, { "@did", dealerId2 } }, conn, tx) <= 0)
+                return false;
+            return true;
+        }
+
         // -----------------------------
-        // INSERT & UPDATE methods
+        // INSERT & UPDATE methods (legacy — prefer RunInTransaction save path)
         // -----------------------------
         private void InsertLedgerRecord(
             int newDealerId1, int newDealerId2,
@@ -387,16 +452,26 @@ namespace ZaibPetroleumService.Model
                         "Kya aap is record ko delete karna chahte hain?", "Confirm Delete");
                     if (confirmDelete.ShowDialog() == DialogResult.Yes)
                     {
-                        // Undo from old dealers
-                        if (firstDealerId != 0 && amountToDelete != 0) SubtractFromDealer1(firstDealerId, amountToDelete);
-                        if (secondDealerId != 0 && amountToDelete != 0) SubtractFromDealer2(secondDealerId, amountToDelete);
-
-                        // Delete from table
-                        string deleteQuery = "DELETE FROM DealertoDealer WHERE LedgerID = @LedgerID";
-                        Hashtable deleteParams = new Hashtable { { "@LedgerID", LedgerID } };
-
-                        int deleteResult = MainClass.DataInsertUpdateDelete(deleteQuery, deleteParams);
-                        if (deleteResult > 0)
+                        bool ok = MainClass.RunInTransaction((conn, tx) =>
+                        {
+                            DataRow row = LocalPersistence.ReadRow("DealertoDealer", "LedgerID", LedgerID, conn, tx);
+                            if (row == null) return false;
+                            string syncId = row.Table.Columns.Contains("SyncId") ? Convert.ToString(row["SyncId"]) : null;
+                            int d1 = row["id"] != DBNull.Value ? Convert.ToInt32(row["id"]) : 0;
+                            int d2 = row["Did"] != DBNull.Value ? Convert.ToInt32(row["Did"]) : 0;
+                            decimal amt = row["AmounGiven"] != DBNull.Value ? Convert.ToDecimal(row["AmounGiven"]) : 0;
+                            if (!AdjustDealerBalancesInTx(conn, tx, d1, d2, -amt, -amt)) return false;
+                            if (!string.IsNullOrWhiteSpace(syncId))
+                            {
+                                SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId + ":from");
+                                SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId + ":to");
+                                LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_transfers", conn, tx);
+                            }
+                            return MainClass.ExecInTx(
+                                "DELETE FROM DealertoDealer WHERE LedgerID = @LedgerID",
+                                new Hashtable { { "@LedgerID", LedgerID } }, conn, tx) > 0;
+                        });
+                        if (ok)
                         {
                             CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya aur amounts adjust ho gaye!", "Success");
                             successMessage.ShowDialog();

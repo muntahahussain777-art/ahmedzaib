@@ -10,6 +10,7 @@ using System.IO;
 using System.Text;
 using System.Windows.Forms;
 using ZaibPetroleumService;
+using ZaibPetroleumService.Services;
 
 namespace ZaibPetroleumService.Model
 {
@@ -1055,31 +1056,33 @@ namespace ZaibPetroleumService.Model
 
             try
             {
-                var ht = new Hashtable
+                bool ok = MainClass.RunInTransaction((conn, tx) =>
                 {
-                    { "@dealerId", dealerId },
-                    { "@amountPaid", amount.ToString("F2") },
-                    { "@paymentDate", DateTime.Today.ToString("yyyy-MM-dd") },
-                    { "@note", "Closing2 → Dealer Payout" }
-                };
-
-                string insertQry = @"INSERT INTO DieselLedgerDebit (Did, AmounGiven, Date, Note)
+                    var ht = new Hashtable
+                    {
+                        { "@dealerId", dealerId },
+                        { "@amountPaid", amount.ToString("F2") },
+                        { "@paymentDate", DateTime.Today.ToString("yyyy-MM-dd") },
+                        { "@note", "Closing2 → Dealer Payout" }
+                    };
+                    string insertQry = @"INSERT INTO DieselLedgerDebit (Did, AmounGiven, Date, Note)
                                      VALUES (@dealerId, @amountPaid, @paymentDate, @note)";
-                int r = MainClass.DataInsertUpdateDelete(insertQry, ht);
-                if (r <= 0)
+                    if (MainClass.ExecInTx(insertQry, ht, conn, tx) <= 0) return false;
+                    if (MainClass.ExecInTx(
+                            "UPDATE AddDealer SET DDAmount = IFNULL(DDAmount, 0) + @amount WHERE Did = @dealerId",
+                            new Hashtable { { "@dealerId", dealerId }, { "@amount", amount.ToString("F2") } },
+                            conn, tx) <= 0)
+                        return false;
+                    long lid = Convert.ToInt64(LocalPersistence.Scalar("SELECT last_insert_rowid()", null, conn, tx));
+                    SupabaseSyncService.RecordLocalChildBalanceEffect(conn, tx, "DieselLedgerDebit", "LedgerID", lid);
+                    return true;
+                });
+                if (!ok)
                 {
                     MessageBox.Show("Dealer Payout mein save nahi hua.", "Error",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
-
-                var htUpd = new Hashtable
-                {
-                    { "@dealerId", dealerId },
-                    { "@amount", amount.ToString("F2") }
-                };
-                MainClass.DataInsertUpdateDelete(
-                    "UPDATE AddDealer SET DDAmount = IFNULL(DDAmount, 0) + @amount WHERE Did = @dealerId", htUpd);
 
                 RefreshGridIfLoaded($"{name} ki amount Dealer Payout mein post ho gayi.");
             }
