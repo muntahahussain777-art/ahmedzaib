@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -10,7 +10,7 @@ import '../data/app_database.dart';
 import 'supabase_config.dart';
 import 'sync_meta.dart';
 
-/// Silent offline-first sync: Mobile ↔ Supabase (zaibservice) ↔ other devices/PC.
+/// Silent offline-first sync: Mobile â†” Supabase (zaibservice) â†” other devices/PC.
 /// Dedup key = sync_id (UUID). Last-write-wins on updated_at.
 class SyncService {
   SyncService._();
@@ -39,18 +39,18 @@ class SyncService {
     _initialized = true;
     await Supabase.initialize(
       url: SupabaseConfig.url,
-      // Same anon JWT WinForms uses (PC→cloud already works)
+      // Same anon JWT WinForms uses (PCâ†’cloud already works)
       anonKey: SupabaseConfig.anonKey,
     );
     await _ensureDeviceId();
-    // Form save → silent sync (debounced, never blocks UI)
+    // Form save â†’ silent sync (debounced, never blocks UI)
     SyncMeta.onLocalChange = () {
       _dirtyDebounce?.cancel();
       _dirtyDebounce = Timer(const Duration(seconds: 2), () {
         unawaited(syncNow());
       });
     };
-    // Force full cloud→local on next sync (fix stale lastPull)
+    // Force full cloudâ†’local on next sync (fix stale lastPull)
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_prefsLastPull);
     _connSub = Connectivity().onConnectivityChanged.listen((results) {
@@ -89,7 +89,7 @@ class SyncService {
     try {
       await _runSyncPass().timeout(_syncTimeout, onTimeout: () {});
     } catch (_) {
-      // Silent — offline / transient errors must not break UI.
+      // Silent â€” offline / transient errors must not break UI.
     } finally {
       _running = false;
       if (_queued) {
@@ -112,7 +112,7 @@ class SyncService {
 
     final deviceId = await _ensureDeviceId();
 
-    // IMPORTANT: pull FIRST so WinForms→Supabase→Mobile always works
+    // IMPORTANT: pull FIRST so WinFormsâ†’Supabaseâ†’Mobile always works
     // even when mobile push has errors.
     try {
       await _pullAll();
@@ -197,6 +197,12 @@ class SyncService {
     } else {
       await db.update(table, map, where: 'SyncId = ?', whereArgs: [syncId]);
     }
+  }
+
+  /// Remote soft-delete â†’ local delete without leaving SyncTombstone (no push loop).
+  Future<void> _applyRemoteDelete(Database db, String table, String syncId) async {
+    await db.delete(table, where: 'SyncId = ?', whereArgs: [syncId]);
+    await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
   }
 
   Future<void> _pushCustomers(Database db, String deviceId) async {
@@ -457,7 +463,7 @@ class SyncService {
   }
 
   Future<void> _pullAll() async {
-    // Full pull — no since filter (PC entries always appear on mobile).
+    // Full pull â€” no since filter (PC entries always appear on mobile).
     // Each table isolated so one failure cannot block the rest.
     Future<void> safe(Future<void> Function() fn) async {
       try {
@@ -539,7 +545,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('AddCustomer', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'AddCustomer', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'AddCustomer', syncId, updated)) continue;
@@ -562,7 +568,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('AddDealer', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'AddDealer', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'AddDealer', syncId, updated)) continue;
@@ -586,7 +592,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('PetrolAdd', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'PetrolAdd', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'PetrolAdd', syncId, updated)) continue;
@@ -620,7 +626,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('DieselLedgerCredit', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'DieselLedgerCredit', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'DieselLedgerCredit', syncId, updated)) continue;
@@ -645,7 +651,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('AddStock', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'AddStock', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'AddStock', syncId, updated)) continue;
@@ -674,7 +680,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('DieselLedgerDebit', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'DieselLedgerDebit', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'DieselLedgerDebit', syncId, updated)) continue;
@@ -699,7 +705,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('StockDiesel', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'StockDiesel', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'StockDiesel', syncId, updated)) continue;
@@ -728,7 +734,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('BankTransactions', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'BankTransactions', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'BankTransactions', syncId, updated)) continue;
@@ -757,7 +763,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
       if (_isDeleted(r['deleted_at'])) {
-        await db.delete('Expensetable', where: 'SyncId = ?', whereArgs: [syncId]);
+        await _applyRemoteDelete(db, 'Expensetable', syncId);
         continue;
       }
       if (!await _shouldApply(db, 'Expensetable', syncId, updated)) continue;
@@ -774,3 +780,4 @@ class SyncService {
     }
   }
 }
+

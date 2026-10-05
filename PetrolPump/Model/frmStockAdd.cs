@@ -4,6 +4,7 @@ using System.Collections;
 using System.Data;
 using System.Globalization;
 using System.Windows.Forms;
+using ZaibPetroleumService.Services;
 
 namespace ZaibPetroleumService.Model
 {
@@ -358,70 +359,60 @@ namespace ZaibPetroleumService.Model
 
             try
             {
-                int r = MainClass.DataInsertUpdateDelete(qry, ht);
-                if (r > 0)
+                int saveId = id;
+                bool ok = MainClass.RunInTransaction((conn, tx) =>
                 {
-                    if (id == 0)
+                    if (saveId == 0)
                     {
-                        // INSERT MODE
-                        UpdateDealerDAmount(dealerId, newAmount);
+                        if (MainClass.ExecInTx(qry, ht, conn, tx) <= 0) return false;
+                        if (dealerId > 0 && newAmount != 0)
+                        {
+                            if (MainClass.ExecInTx(
+                                    "UPDATE AddDealer SET DDAmount = DDAmount + @ddAmount WHERE Did = @Did",
+                                    new Hashtable { { "@Did", dealerId }, { "@ddAmount", newAmount } },
+                                    conn, tx) <= 0)
+                                return false;
+                        }
+                        return true;
+                    }
+
+                    DataRow old = LocalPersistence.ReadRow("AddStock", "Sid", saveId, conn, tx);
+                    if (old == null) return false;
+                    int authOldDealerId = Convert.ToInt32(old["DealerId"]);
+                    decimal authOldRate = Convert.ToDecimal(old["Rate"]);
+                    decimal authOldAdd = Convert.ToDecimal(old["AddDisel"]);
+                    decimal oldAmount = authOldRate * authOldAdd;
+
+                    if (MainClass.ExecInTx(qry, ht, conn, tx) <= 0) return false;
+
+                    if (dealerId == authOldDealerId)
+                    {
+                        if (MainClass.ExecInTx(
+                                "UPDATE AddDealer SET DDAmount = DDAmount - @oldAmount + @newAmount WHERE Did = @Did",
+                                new Hashtable { { "@oldAmount", oldAmount }, { "@newAmount", newAmount }, { "@Did", dealerId } },
+                                conn, tx) <= 0)
+                            return false;
                     }
                     else
                     {
-                        // UPDATE MODE: purana minus + naya plus
-                        if (oldDealerId == 0)
-                        {
-                            string getOldQry = "SELECT DealerId, Rate, AddDisel FROM AddStock WHERE Sid = @id";
-                            Hashtable htOld = new Hashtable();
-                            htOld.Add("@id", id);
-                            DataTable dtOld = MainClass.ExecuteSelectQuery(getOldQry, htOld);
-                            if (dtOld != null && dtOld.Rows.Count > 0)
-                            {
-                                oldDealerId = Convert.ToInt32(dtOld.Rows[0]["DealerId"]);
-                                oldRate = Convert.ToDecimal(dtOld.Rows[0]["Rate"]);
-                                oldAddDisel = Convert.ToDecimal(dtOld.Rows[0]["AddDisel"]);
-                            }
-                        }
-
-                        decimal oldAmount = oldRate * oldAddDisel;
-
-                        if (dealerId == oldDealerId)
-                        {
-                            string updSameDealer = "UPDATE AddDealer " +
-                                                   "SET DDAmount = DDAmount - @oldAmount + @newAmount " +
-                                                   "WHERE Did = @Did";
-
-                            Hashtable htSame = new Hashtable();
-                            htSame.Add("@oldAmount", oldAmount);
-                            htSame.Add("@newAmount", newAmount);
-                            htSame.Add("@Did", dealerId);
-
-                            MainClass.DataInsertUpdateDelete(updSameDealer, htSame);
-                        }
-                        else
-                        {
-                            string updOldDealer = "UPDATE AddDealer " +
-                                                  "SET DDAmount = DDAmount - @oldAmount " +
-                                                  "WHERE Did = @OldDid";
-
-                            Hashtable htOldDealer = new Hashtable();
-                            htOldDealer.Add("@oldAmount", oldAmount);
-                            htOldDealer.Add("@OldDid", oldDealerId);
-
-                            MainClass.DataInsertUpdateDelete(updOldDealer, htOldDealer);
-
-                            string updNewDealer = "UPDATE AddDealer " +
-                                                  "SET DDAmount = DDAmount + @newAmount " +
-                                                  "WHERE Did = @NewDid";
-
-                            Hashtable htNewDealer = new Hashtable();
-                            htNewDealer.Add("@newAmount", newAmount);
-                            htNewDealer.Add("@NewDid", dealerId);
-
-                            MainClass.DataInsertUpdateDelete(updNewDealer, htNewDealer);
-                        }
+                        if (authOldDealerId > 0 &&
+                            MainClass.ExecInTx(
+                                "UPDATE AddDealer SET DDAmount = DDAmount - @oldAmount WHERE Did = @OldDid",
+                                new Hashtable { { "@oldAmount", oldAmount }, { "@OldDid", authOldDealerId } },
+                                conn, tx) <= 0)
+                            return false;
+                        if (dealerId > 0 &&
+                            MainClass.ExecInTx(
+                                "UPDATE AddDealer SET DDAmount = DDAmount + @newAmount WHERE Did = @NewDid",
+                                new Hashtable { { "@newAmount", newAmount }, { "@NewDid", dealerId } },
+                                conn, tx) <= 0)
+                            return false;
                     }
+                    return true;
+                });
 
+                if (ok)
+                {
                     CustomeMessage successMessage = new CustomeMessage("Entry save ho gayi!", "Success");
                     successMessage.ShowDialog();
                     MainClass.Enable_reset_keep_date(this, txtdate);
@@ -473,18 +464,37 @@ namespace ZaibPetroleumService.Model
                     YesOrNoMessage confirmDelete = new YesOrNoMessage("Kya aap is record ko delete karna chahte hain?", "Confirm Delete");
                     if (confirmDelete.ShowDialog() == DialogResult.Yes)
                     {
-                        string qry = "DELETE FROM AddStock WHERE Sid = @id";
-                        Hashtable htDelete = new Hashtable();
-                        htDelete.Add("@id", id);
-
-                        int deleteResult = MainClass.DataInsertUpdateDelete(qry, htDelete);
-                        if (deleteResult > 0)
+                        bool ok = MainClass.RunInTransaction((conn, tx) =>
                         {
-                            if (dealerId > 0)
+                            DataRow old = LocalPersistence.ReadRow("AddStock", "Sid", id, conn, tx);
+                            if (old == null) return false;
+                            int delDealerId = Convert.ToInt32(old["DealerId"]);
+                            decimal delRate = Convert.ToDecimal(old["Rate"]);
+                            decimal delAdd = Convert.ToDecimal(old["AddDisel"]);
+                            string syncId = old.Table.Columns.Contains("SyncId") ? old["SyncId"]?.ToString() : null;
+                            decimal ddAmountToSubtract = delRate * delAdd;
+
+                            if (MainClass.ExecInTx(
+                                    "DELETE FROM AddStock WHERE Sid = @id",
+                                    new Hashtable { { "@id", id } },
+                                    conn, tx) <= 0)
+                                return false;
+
+                            LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_purchases", conn, tx);
+
+                            if (delDealerId > 0 && ddAmountToSubtract != 0)
                             {
-                                decimal ddAmountToSubtract = rate * addDisel;
-                                UpdateDealerDAmount(dealerId, -ddAmountToSubtract);
+                                if (MainClass.ExecInTx(
+                                        "UPDATE AddDealer SET DDAmount = DDAmount + @ddAmount WHERE Did = @Did",
+                                        new Hashtable { { "@Did", delDealerId }, { "@ddAmount", -ddAmountToSubtract } },
+                                        conn, tx) <= 0)
+                                    return false;
                             }
+                            return true;
+                        });
+
+                        if (ok)
+                        {
                             CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");
                             successMessage.ShowDialog();
                             MainClass.Enable_reset_keep_date(this, txtdate);

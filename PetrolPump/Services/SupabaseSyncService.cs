@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.SQLite;
@@ -16,7 +16,7 @@ using ZaibPetroleumService.ProjectConnection;
 namespace ZaibPetroleumService.Services
 {
     /// <summary>
-    /// Silent Mobile↔PC sync via Supabase schema zaibservice.
+    /// Silent Mobileâ†”PC sync via Supabase schema zaibservice.
     /// Dedup = sync_id. No UI changes.
     /// </summary>
     public static class SupabaseSyncService
@@ -624,6 +624,25 @@ END;";
             }
         }
 
+        /// <summary>
+        /// Remote soft-delete apply: local row delete must NOT leave SyncTombstone
+        /// (delete triggers would re-push and create sync loops).
+        /// </summary>
+        private static void ApplyRemoteDelete(SQLiteConnection con, string table, string syncId)
+        {
+            if (string.IsNullOrWhiteSpace(syncId)) return;
+            using (var d = new SQLiteCommand($"DELETE FROM {table} WHERE SyncId=@s", con))
+            {
+                d.Parameters.AddWithValue("@s", syncId);
+                d.ExecuteNonQuery();
+            }
+            using (var t = new SQLiteCommand("DELETE FROM SyncTombstone WHERE SyncId=@s", con))
+            {
+                t.Parameters.AddWithValue("@s", syncId);
+                t.ExecuteNonQuery();
+            }
+        }
+
         private static async Task PullCustomers(SQLiteConnection con)
         {
             foreach (var r in await SelectSinceAsync("zaib_customers"))
@@ -633,11 +652,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM AddCustomer WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "AddCustomer", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "AddCustomer", syncId, updated)) continue;
@@ -682,11 +697,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM AddDealer WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "AddDealer", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "AddDealer", syncId, updated)) continue;
@@ -733,11 +744,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM PetrolAdd WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "PetrolAdd", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "PetrolAdd", syncId, updated)) continue;
@@ -798,11 +805,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM AddStock WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "AddStock", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "AddStock", syncId, updated)) continue;
@@ -856,11 +859,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM StockDiesel WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "StockDiesel", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "StockDiesel", syncId, updated)) continue;
@@ -899,11 +898,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM BankTransactions WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "BankTransactions", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "BankTransactions", syncId, updated)) continue;
@@ -943,11 +938,7 @@ END;";
                 string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
                 if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
                 {
-                    using (var d = new SQLiteCommand("DELETE FROM Expensetable WHERE SyncId=@s", con))
-                    {
-                        d.Parameters.AddWithValue("@s", syncId);
-                        d.ExecuteNonQuery();
-                    }
+                    ApplyRemoteDelete(con, "Expensetable", syncId);
                     continue;
                 }
                 if (!ShouldApply(con, "Expensetable", syncId, updated)) continue;
@@ -990,11 +981,7 @@ END;";
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
             if (r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null)
             {
-                using (var d = new SQLiteCommand($"DELETE FROM {localTable} WHERE SyncId=@s", con))
-                {
-                    d.Parameters.AddWithValue("@s", syncId);
-                    d.ExecuteNonQuery();
-                }
+                ApplyRemoteDelete(con, localTable, syncId);
                 return Task.CompletedTask;
             }
             if (!ShouldApply(con, localTable, syncId, updated)) return Task.CompletedTask;
@@ -1018,3 +1005,4 @@ END;";
         }
     }
 }
+
