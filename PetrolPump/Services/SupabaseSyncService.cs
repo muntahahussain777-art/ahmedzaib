@@ -113,15 +113,34 @@ namespace ZaibPetroleumService.Services
         private static string GetCheckpoint(string cloudTable)
         {
             if (_lastPullByTable.TryGetValue(cloudTable, out var v) && !string.IsNullOrWhiteSpace(v))
+            {
+                if (!v.Contains("|")) return v + "|";
                 return v;
-            return DefaultPull;
+            }
+            return DefaultPull + "|";
         }
 
         private static void SetCheckpoint(string cloudTable, string updatedAt)
         {
+            SetCheckpoint(cloudTable, updatedAt, "");
+        }
+
+        private static void SetCheckpoint(string cloudTable, string updatedAt, string syncId)
+        {
             if (string.IsNullOrWhiteSpace(updatedAt)) return;
-            _lastPullByTable[cloudTable] = updatedAt;
+            _lastPullByTable[cloudTable] = updatedAt + "|" + (syncId ?? "");
             SaveState();
+        }
+
+        private static void SplitCheckpoint(string cursor, out string updatedAt, out string syncId)
+        {
+            updatedAt = DefaultPull;
+            syncId = "";
+            if (string.IsNullOrWhiteSpace(cursor)) return;
+            int i = cursor.IndexOf('|');
+            if (i < 0) { updatedAt = cursor; return; }
+            updatedAt = cursor.Substring(0, i);
+            syncId = cursor.Substring(i + 1);
         }
 
         private static void SaveState()
@@ -179,6 +198,16 @@ namespace ZaibPetroleumService.Services
                     PayloadJson TEXT NOT NULL,
                     UpdatedAt TEXT NOT NULL,
                     PRIMARY KEY (CloudTable, SyncId)
+                );");
+                Exec(con, @"CREATE TABLE IF NOT EXISTS SyncRejectedUpload (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    At TEXT NOT NULL,
+                    CloudTable TEXT NOT NULL,
+                    SyncId TEXT NOT NULL,
+                    LocalUpdatedAt TEXT,
+                    PayloadJson TEXT NOT NULL,
+                    ServerPayloadJson TEXT,
+                    Outcome TEXT NOT NULL
                 );");
 
                 BackfillSyncIds(con, "AddCustomer", "id");
@@ -450,61 +479,164 @@ END;";
             }
         }
 
-        private static async Task<bool> UpsertAsync(string table, object row)
+        private enum UploadAck { Accepted, Duplicate, Conflict, Failure }
+
+        private static async Task<UploadAck> UpsertAsync(string table, object row)
         {
             string json = JsonConvert.SerializeObject(row);
-            var req = new HttpRequestMessage(HttpMethod.Post, $"{Url}/rest/v1/{table}?on_conflict=sync_id")
-            {
-                Content = new StringContent(json, Encoding.UTF8, "application/json")
-            };
-            req.Headers.Add("Prefer", "resolution=merge-duplicates,return=representation");
-            var res = await Http.SendAsync(req);
-            res.EnsureSuccessStatusCode();
-            string body = await res.Content.ReadAsStringAsync();
-            if (string.IsNullOrWhiteSpace(body) || body == "[]") return true;
+            var uploaded = JObject.Parse(json);
+            string upAt = uploaded.Value<string>("updated_at");
+            string upDev = uploaded.Value<string>("device_id");
             try
             {
-                var arr = JArray.Parse(body);
-                if (arr.Count == 0) return true;
-                var returned = arr[0] as JObject;
-                var uploaded = JObject.Parse(json);
-                string upAt = uploaded.Value<string>("updated_at");
-                string retAt = returned?.Value<string>("updated_at");
-                string upDev = uploaded.Value<string>("device_id");
-                string retDev = returned?.Value<string>("device_id");
-                if (string.IsNullOrWhiteSpace(upAt) || string.IsNullOrWhiteSpace(retAt)) return true;
-                DateTime u = DateTime.TryParse(upAt, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
-                DateTime r = DateTime.TryParse(retAt, out var rt) ? rt.ToUniversalTime() : DateTime.MinValue;
-                if (u != r) return false;
-                if (!string.IsNullOrEmpty(upDev) && !string.IsNullOrEmpty(retDev) && upDev != retDev) return false;
-                return true;
+                var req = new HttpRequestMessage(HttpMethod.Post, $"{Url}/rest/v1/{table}?on_conflict=sync_id")
+                {
+                    Content = new StringContent(json, Encoding.UTF8, "application/json")
+                };
+                req.Headers.Add("Prefer", "resolution=merge-duplicates,return=representation");
+                var res = await Http.SendAsync(req);
+                if (!res.IsSuccessStatusCode) return UploadAck.Failure;
+                string body = await res.Content.ReadAsStringAsync();
+                if (string.IsNullOrWhiteSpace(body) || body == "[]") return UploadAck.Failure;
+                try
+                {
+                    var arr = JArray.Parse(body);
+                    if (arr.Count == 0) return UploadAck.Failure;
+                    var returned = arr[0] as JObject;
+                    string retAt = returned?.Value<string>("updated_at");
+                    string retDev = returned?.Value<string>("device_id");
+                    if (string.IsNullOrWhiteSpace(upAt) || string.IsNullOrWhiteSpace(retAt)) return UploadAck.Failure;
+                    DateTime u = DateTime.TryParse(upAt, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
+                    DateTime r = DateTime.TryParse(retAt, out var rt) ? rt.ToUniversalTime() : DateTime.MinValue;
+                    if (u == r && (string.IsNullOrEmpty(upDev) || string.IsNullOrEmpty(retDev) || upDev == retDev))
+                        return UploadAck.Accepted;
+                    return UploadAck.Conflict;
+                }
+                catch
+                {
+                    return UploadAck.Failure;
+                }
             }
             catch
             {
-                return true;
+                return UploadAck.Failure;
+            }
+        }
+
+        private static async Task FinishUpload(
+            SQLiteConnection con,
+            string cloudTable,
+            string localTable,
+            string pk,
+            object id,
+            string syncId,
+            string uploadedUpdatedAt,
+            string uploadedJson,
+            UploadAck ack)
+        {
+            if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate)
+            {
+                MarkCleanIfVersion(con, localTable, pk, id, syncId, uploadedUpdatedAt);
+                return;
+            }
+            if (ack == UploadAck.Failure)
+            {
+                LogFail(con, "upload:failure:" + cloudTable, syncId, new Exception("empty/invalid ack or transport failure"));
+                return;
+            }
+
+            string serverJson = null;
+            try
+            {
+                var res = await Http.GetAsync($"{Url}/rest/v1/{cloudTable}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=*&limit=1");
+                if (res.IsSuccessStatusCode)
+                {
+                    var body = await res.Content.ReadAsStringAsync();
+                    var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
+                    if (arr.Count > 0 && arr[0] is JObject jo)
+                    {
+                        serverJson = jo.ToString(Formatting.None);
+                        StageRemote(con, cloudTable, jo);
+                    }
+                }
+            }
+            catch (Exception ex) { LogFail(con, "upload:conflict-fetch:" + cloudTable, syncId, ex); }
+
+            string localNow = null;
+            using (var cmd = new SQLiteCommand($"SELECT UpdatedAt FROM {localTable} WHERE {pk}=@id LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@id", id);
+                var v = cmd.ExecuteScalar();
+                localNow = v == null || v == DBNull.Value ? null : Convert.ToString(v);
+            }
+            bool sameVersion = !string.IsNullOrWhiteSpace(localNow) && !string.IsNullOrWhiteSpace(uploadedUpdatedAt)
+                && string.Equals(localNow, uploadedUpdatedAt, StringComparison.Ordinal);
+            string outcome = sameVersion ? "adoptServerClearDirty" : "keepLocalDirtyStageServer";
+            try
+            {
+                using (var cmd = new SQLiteCommand(
+                    @"INSERT INTO SyncRejectedUpload(At,CloudTable,SyncId,LocalUpdatedAt,PayloadJson,ServerPayloadJson,Outcome)
+                      VALUES(@a,@t,@s,@u,@p,@sp,@o)", con))
+                {
+                    cmd.Parameters.AddWithValue("@a", DateTime.UtcNow.ToString("o"));
+                    cmd.Parameters.AddWithValue("@t", cloudTable);
+                    cmd.Parameters.AddWithValue("@s", syncId);
+                    cmd.Parameters.AddWithValue("@u", (object)uploadedUpdatedAt ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@p", uploadedJson ?? "{}");
+                    cmd.Parameters.AddWithValue("@sp", (object)serverJson ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@o", outcome);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch { }
+
+            if (sameVersion)
+            {
+                using (var u = new SQLiteCommand(
+                    $"UPDATE {localTable} SET SyncDirty=0 WHERE {pk}=@id AND UpdatedAt=@u", con))
+                {
+                    u.Parameters.AddWithValue("@id", id);
+                    u.Parameters.AddWithValue("@u", uploadedUpdatedAt);
+                    u.ExecuteNonQuery();
+                }
             }
         }
 
         private static async Task<List<JObject>> SelectSincePagedAsync(string table)
         {
             var all = new List<JObject>();
-            string since = GetCheckpoint(table);
+            SplitCheckpoint(GetCheckpoint(table), out string sinceAt, out string sinceId);
             int from = 0;
             while (true)
             {
+                // gte updated_at then client-filter by (updated_at, sync_id) composite cursor
                 string url =
-                    $"{Url}/rest/v1/{table}?select=*&updated_at=gt.{Uri.EscapeDataString(since)}" +
+                    $"{Url}/rest/v1/{table}?select=*&updated_at=gte.{Uri.EscapeDataString(sinceAt)}" +
                     $"&order=updated_at.asc,sync_id.asc&limit={PageSize}&offset={from}";
                 var res = await Http.GetAsync(url);
                 res.EnsureSuccessStatusCode();
                 string body = await res.Content.ReadAsStringAsync();
                 var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
+                int kept = 0;
                 foreach (var t in arr)
                 {
-                    if (t is JObject jo) all.Add(jo);
+                    if (t is JObject jo)
+                    {
+                        string u = jo.Value<string>("updated_at") ?? "";
+                        string s = jo.Value<string>("sync_id") ?? "";
+                        DateTime du = DateTime.TryParse(u, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
+                        DateTime ds = DateTime.TryParse(sinceAt, out var st) ? st.ToUniversalTime() : DateTime.MinValue;
+                        int cmp = du.CompareTo(ds);
+                        if (cmp > 0 || (cmp == 0 && string.CompareOrdinal(s, sinceId) > 0))
+                        {
+                            all.Add(jo);
+                            kept++;
+                        }
+                    }
                 }
                 if (arr.Count < PageSize) break;
                 from += PageSize;
+                if (kept == 0 && from > PageSize * 20) break; // safety
             }
             return all;
         }
@@ -545,12 +677,15 @@ END;";
             return string.IsNullOrWhiteSpace(v) ? DateTime.UtcNow.ToString("o") : v;
         }
 
-        private static void AdvanceCheckpoint(string cloudTable, string updatedAt, ref string appliedMax)
+        private static void AdvanceCheckpoint(string updatedAt, string syncId, ref string appliedMax)
         {
             if (string.IsNullOrWhiteSpace(updatedAt)) return;
+            SplitCheckpoint(appliedMax ?? "", out var curAt, out var curId);
             DateTime u = DateTime.TryParse(updatedAt, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
-            DateTime m = DateTime.TryParse(appliedMax, out var mt) ? mt.ToUniversalTime() : DateTime.MinValue;
-            if (u >= m) appliedMax = updatedAt;
+            DateTime m = DateTime.TryParse(curAt, out var mt) ? mt.ToUniversalTime() : DateTime.MinValue;
+            int cmp = u.CompareTo(m);
+            if (cmp > 0 || (cmp == 0 && string.CompareOrdinal(syncId ?? "", curId ?? "") > 0))
+                appliedMax = updatedAt + "|" + (syncId ?? "");
         }
 
         private static void StageRemote(SQLiteConnection con, string cloudTable, JObject row)
@@ -599,7 +734,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_customers", new
+                    var ack = await UpsertAsync("zaib_customers", new
                     {
                         sync_id = syncId,
                         local_id = r["id"],
@@ -610,7 +745,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "AddCustomer", "id", r["id"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_customers", "AddCustomer", "id", r["id"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_customers", syncId, ex); }
             }
@@ -625,7 +760,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_dealers", new
+                    var ack = await UpsertAsync("zaib_dealers", new
                     {
                         sync_id = syncId,
                         local_id = r["Did"],
@@ -637,7 +772,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "AddDealer", "Did", r["Did"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_dealers", "AddDealer", "Did", r["Did"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealers", syncId, ex); }
             }
@@ -664,7 +799,7 @@ END;";
                 }
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_petrol_entries", new
+                    var ack = await UpsertAsync("zaib_petrol_entries", new
                     {
                         sync_id = syncId,
                         local_id = r["pid"],
@@ -686,7 +821,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "PetrolAdd", "pid", r["pid"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_petrol_entries", "PetrolAdd", "pid", r["pid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_petrol_entries", syncId, ex); }
             }
@@ -703,7 +838,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_dealer_payouts", new
+                    var ack = await UpsertAsync("zaib_dealer_payouts", new
                     {
                         sync_id = syncId,
                         local_id = r["LedgerID"],
@@ -716,7 +851,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "DieselLedgerCredit", "LedgerID", r["LedgerID"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_dealer_payouts", "DieselLedgerCredit", "LedgerID", r["LedgerID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_payouts", syncId, ex); }
             }
@@ -733,7 +868,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_dealer_purchases", new
+                    var ack = await UpsertAsync("zaib_dealer_purchases", new
                     {
                         sync_id = syncId,
                         local_id = r["Sid"],
@@ -748,7 +883,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "AddStock", "Sid", r["Sid"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_dealer_purchases", "AddStock", "Sid", r["Sid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_purchases", syncId, ex); }
             }
@@ -765,7 +900,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_dealer_direct", new
+                    var ack = await UpsertAsync("zaib_dealer_direct", new
                     {
                         sync_id = syncId,
                         local_id = r["LedgerID"],
@@ -778,7 +913,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "DieselLedgerDebit", "LedgerID", r["LedgerID"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_dealer_direct", "DieselLedgerDebit", "LedgerID", r["LedgerID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_direct", syncId, ex); }
             }
@@ -795,7 +930,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["SDid"]);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_stock_diesel", new
+                    var ack = await UpsertAsync("zaib_stock_diesel", new
                     {
                         sync_id = syncId,
                         local_id = r["SID"],
@@ -812,7 +947,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "StockDiesel", "SID", r["SID"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_stock_diesel", "StockDiesel", "SID", r["SID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_stock_diesel", syncId, ex); }
             }
@@ -831,7 +966,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_bank_transactions", new
+                    var ack = await UpsertAsync("zaib_bank_transactions", new
                     {
                         sync_id = syncId,
                         local_id = r["Id"],
@@ -848,7 +983,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "BankTransactions", "Id", r["Id"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_bank_transactions", "BankTransactions", "Id", r["Id"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_bank_transactions", syncId, ex); }
             }
@@ -864,7 +999,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    bool ok = await UpsertAsync("zaib_expenses", new
+                    var ack = await UpsertAsync("zaib_expenses", new
                     {
                         sync_id = syncId,
                         local_id = r["sid"],
@@ -877,7 +1012,7 @@ END;";
                         deleted_at = (string)null,
                         device_id = _deviceId
                     });
-                    if (ok) MarkCleanIfVersion(con, "Expensetable", "sid", r["sid"], syncId, updatedAt);
+                    await FinishUpload(con, "zaib_expenses", "Expensetable", "sid", r["sid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_expenses", syncId, ex); }
             }
@@ -893,20 +1028,42 @@ END;";
                 string deletedAt = Convert.ToString(r["DeletedAt"]);
                 try
                 {
-                    bool ok = await UpsertAsync(table, new
+                    var ack = await UpsertAsync(table, new
                     {
                         sync_id = syncId,
                         updated_at = deletedAt,
                         deleted_at = deletedAt,
                         device_id = _deviceId
                     });
-                    if (ok)
+                    if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate)
                     {
                         using (var d = new SQLiteCommand("DELETE FROM SyncTombstone WHERE SyncId=@s", con))
                         {
                             d.Parameters.AddWithValue("@s", syncId);
                             d.ExecuteNonQuery();
                         }
+                    }
+                    else if (ack == UploadAck.Conflict)
+                    {
+                        // Idempotent: if server already has deleted_at, clear local tombstone.
+                        try
+                        {
+                            var res = await Http.GetAsync($"{Url}/rest/v1/{table}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=deleted_at&limit=1");
+                            if (res.IsSuccessStatusCode)
+                            {
+                                var body = await res.Content.ReadAsStringAsync();
+                                var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
+                                if (arr.Count > 0 && arr[0]["deleted_at"] != null && arr[0]["deleted_at"].Type != JTokenType.Null)
+                                {
+                                    using (var d = new SQLiteCommand("DELETE FROM SyncTombstone WHERE SyncId=@s", con))
+                                    {
+                                        d.Parameters.AddWithValue("@s", syncId);
+                                        d.ExecuteNonQuery();
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
                     }
                 }
                 catch (Exception ex) { LogFail(con, "push:tombstone", syncId, ex); }
@@ -937,6 +1094,17 @@ END;";
             {
                 cmd.Parameters.AddWithValue("@s", syncId);
                 return cmd.ExecuteScalar() != null;
+            }
+        }
+
+        private static bool IsSyncDirty(SQLiteConnection con, string table, string syncId)
+        {
+            using (var cmd = new SQLiteCommand($"SELECT SyncDirty FROM {table} WHERE SyncId=@s LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@s", syncId);
+                var v = cmd.ExecuteScalar();
+                if (v == null || v == DBNull.Value) return false;
+                return Convert.ToInt32(v) == 1;
             }
         }
 
@@ -1027,13 +1195,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "AddCustomer", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_customers", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "AddCustomer", syncId))
+                        StageRemote(con, "zaib_customers", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "AddCustomer", syncId);
-                    AdvanceCheckpoint("zaib_customers", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 using (var chk = new SQLiteCommand("SELECT id FROM AddCustomer WHERE SyncId=@s", con))
@@ -1065,7 +1235,7 @@ END;";
                         }
                     }
                 }
-                AdvanceCheckpoint("zaib_customers", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1081,13 +1251,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "AddDealer", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_dealers", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "AddDealer", syncId))
+                        StageRemote(con, "zaib_dealers", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "AddDealer", syncId);
-                    AdvanceCheckpoint("zaib_dealers", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 using (var chk = new SQLiteCommand("SELECT Did FROM AddDealer WHERE SyncId=@s", con))
@@ -1133,7 +1305,7 @@ END;";
                         }
                     }
                 }
-                AdvanceCheckpoint("zaib_dealers", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1149,13 +1321,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "PetrolAdd", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_petrol_entries", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "PetrolAdd", syncId))
+                        StageRemote(con, "zaib_petrol_entries", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "PetrolAdd", syncId);
-                    AdvanceCheckpoint("zaib_petrol_entries", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 string custSync = r.Value<string>("customer_sync_id");
@@ -1192,7 +1366,7 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
-                AdvanceCheckpoint("zaib_petrol_entries", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1213,7 +1387,7 @@ END;";
                     "Did,Date,AmounGiven,Note",
                     "AddDealer", "Did", "dealer_sync_id");
                 if (applied)
-                    AdvanceCheckpoint("zaib_dealer_payouts", r.Value<string>("updated_at"), ref appliedMax);
+                    AdvanceCheckpoint(r.Value<string>("updated_at"), r.Value<string>("sync_id") ?? "", ref appliedMax);
             }
             return appliedMax;
         }
@@ -1229,13 +1403,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "AddStock", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_dealer_purchases", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "AddStock", syncId))
+                        StageRemote(con, "zaib_dealer_purchases", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "AddStock", syncId);
-                    AdvanceCheckpoint("zaib_dealer_purchases", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 string dSync = r.Value<string>("dealer_sync_id");
@@ -1265,7 +1441,7 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
-                AdvanceCheckpoint("zaib_dealer_purchases", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1286,7 +1462,7 @@ END;";
                     "Did,Date,AmounGiven,Note",
                     "AddDealer", "Did", "dealer_sync_id");
                 if (applied)
-                    AdvanceCheckpoint("zaib_dealer_direct", r.Value<string>("updated_at"), ref appliedMax);
+                    AdvanceCheckpoint(r.Value<string>("updated_at"), r.Value<string>("sync_id") ?? "", ref appliedMax);
             }
             return appliedMax;
         }
@@ -1302,13 +1478,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "StockDiesel", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_stock_diesel", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "StockDiesel", syncId))
+                        StageRemote(con, "zaib_stock_diesel", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "StockDiesel", syncId);
-                    AdvanceCheckpoint("zaib_stock_diesel", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 string dSync = r.Value<string>("dealer_sync_id");
@@ -1340,7 +1518,7 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
-                AdvanceCheckpoint("zaib_stock_diesel", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1356,13 +1534,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "BankTransactions", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_bank_transactions", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "BankTransactions", syncId))
+                        StageRemote(con, "zaib_bank_transactions", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "BankTransactions", syncId);
-                    AdvanceCheckpoint("zaib_bank_transactions", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 string cSync = r.Value<string>("customer_sync_id");
@@ -1396,7 +1576,7 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
-                AdvanceCheckpoint("zaib_bank_transactions", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1413,13 +1593,15 @@ END;";
                 bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
                 if (!ShouldApply(con, "Expensetable", syncId, updated, deleted, r.Value<string>("device_id")))
                 {
-                    AdvanceCheckpoint("zaib_expenses", updated, ref appliedMax);
+                    if (HasTombstone(con, syncId) || IsSyncDirty(con, "Expensetable", syncId))
+                        StageRemote(con, "zaib_expenses", r);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 if (deleted)
                 {
                     ApplyRemoteDelete(con, "Expensetable", syncId);
-                    AdvanceCheckpoint("zaib_expenses", updated, ref appliedMax);
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
                 }
                 using (var chk = new SQLiteCommand("SELECT sid FROM Expensetable WHERE SyncId=@s", con))
@@ -1441,7 +1623,7 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
-                AdvanceCheckpoint("zaib_expenses", updated, ref appliedMax);
+                AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
         }
@@ -1503,7 +1685,12 @@ END;";
                                 }
                             }
                         }
-                        else applied = true;
+                        else
+                        {
+                            // Pending local dirty/tombstone — keep staged; do not pretend applied.
+                            StageRemote(con, cloud, payload);
+                            applied = false;
+                        }
                     }
                     else if (cloud == "zaib_dealer_payouts")
                     {
@@ -1529,9 +1716,141 @@ END;";
                             },
                             "Did,Date,AmounGiven,Note", "AddDealer", "Did", "dealer_sync_id");
                     }
+                    else if (cloud == "zaib_dealer_purchases")
+                    {
+                        string updated = payload.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
+                        bool deleted = payload["deleted_at"] != null && payload["deleted_at"].Type != JTokenType.Null;
+                        if (!ShouldApply(con, "AddStock", syncId, updated, deleted, payload.Value<string>("device_id")))
+                        {
+                            applied = false;
+                        }
+                        else if (deleted) { ApplyRemoteDelete(con, "AddStock", syncId); applied = true; }
+                        else
+                        {
+                            string dSync = payload.Value<string>("dealer_sync_id");
+                            object did = LocalIdBySync(con, "AddDealer", "Did", dSync);
+                            if (!string.IsNullOrWhiteSpace(dSync) && (did == null || did == DBNull.Value))
+                                applied = false;
+                            else
+                            {
+                                using (var chk = new SQLiteCommand("SELECT Sid FROM AddStock WHERE SyncId=@s", con))
+                                {
+                                    chk.Parameters.AddWithValue("@s", syncId);
+                                    var exists = chk.ExecuteScalar();
+                                    string sql = exists == null
+                                        ? "INSERT INTO AddStock(Vehicle,Rate,SellDisel,Stock,Date,AddDisel,DealerId,Note,SyncId,UpdatedAt,SyncDirty) VALUES(@Vehicle,@Rate,0,0,@Date,@AddDisel,@DealerId,@Note,@s,@u,0)"
+                                        : "UPDATE AddStock SET Vehicle=@Vehicle,Rate=@Rate,Date=@Date,AddDisel=@AddDisel,DealerId=@DealerId,Note=@Note,UpdatedAt=@u,SyncDirty=0 WHERE SyncId=@s";
+                                    using (var cmd = new SQLiteCommand(sql, con))
+                                    {
+                                        cmd.Parameters.AddWithValue("@Vehicle", payload.Value<string>("vehicle") ?? "");
+                                        cmd.Parameters.AddWithValue("@Rate", payload.Value<double?>("rate") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Date", payload.Value<string>("date_text") ?? "");
+                                        cmd.Parameters.AddWithValue("@AddDisel", payload.Value<double?>("add_diesel") ?? 0);
+                                        cmd.Parameters.AddWithValue("@DealerId", did ?? (object)DBNull.Value);
+                                        cmd.Parameters.AddWithValue("@Note", payload.Value<string>("note") ?? "");
+                                        cmd.Parameters.AddWithValue("@s", syncId);
+                                        cmd.Parameters.AddWithValue("@u", updated);
+                                        cmd.ExecuteNonQuery();
+                                    }
+                                }
+                                applied = true;
+                            }
+                        }
+                    }
+                    else if (cloud == "zaib_stock_diesel")
+                    {
+                        string updated = payload.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
+                        bool deleted = payload["deleted_at"] != null && payload["deleted_at"].Type != JTokenType.Null;
+                        if (!ShouldApply(con, "StockDiesel", syncId, updated, deleted, payload.Value<string>("device_id")))
+                            applied = false;
+                        else if (deleted) { ApplyRemoteDelete(con, "StockDiesel", syncId); applied = true; }
+                        else
+                        {
+                            string dSync = payload.Value<string>("dealer_sync_id");
+                            object did = LocalIdBySync(con, "AddDealer", "Did", dSync);
+                            if (!string.IsNullOrWhiteSpace(dSync) && (did == null || did == DBNull.Value))
+                                applied = false;
+                            else
+                            {
+                                using (var chk = new SQLiteCommand("SELECT SID FROM StockDiesel WHERE SyncId=@s", con))
+                                {
+                                    chk.Parameters.AddWithValue("@s", syncId);
+                                    var exists = chk.ExecuteScalar();
+                                    string sql = exists == null
+                                        ? "INSERT INTO StockDiesel(SDid,Date,Vehicle,Litter,Rate,Credit,Debit,Note,SyncId,UpdatedAt,SyncDirty) VALUES(@SDid,@Date,@Vehicle,@Litter,@Rate,@Credit,@Debit,@Note,@s,@u,0)"
+                                        : "UPDATE StockDiesel SET SDid=@SDid,Date=@Date,Vehicle=@Vehicle,Litter=@Litter,Rate=@Rate,Credit=@Credit,Debit=@Debit,Note=@Note,UpdatedAt=@u,SyncDirty=0 WHERE SyncId=@s";
+                                    using (var cmd = new SQLiteCommand(sql, con))
+                                    {
+                                        cmd.Parameters.AddWithValue("@SDid", did ?? (object)DBNull.Value);
+                                        cmd.Parameters.AddWithValue("@Date", payload.Value<string>("date_text") ?? "");
+                                        cmd.Parameters.AddWithValue("@Vehicle", payload.Value<string>("vehicle") ?? "");
+                                        cmd.Parameters.AddWithValue("@Litter", payload.Value<double?>("litter") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Rate", payload.Value<double?>("rate") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Credit", payload.Value<double?>("credit") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Debit", payload.Value<double?>("debit") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Note", payload.Value<string>("note") ?? "");
+                                        cmd.Parameters.AddWithValue("@s", syncId);
+                                        cmd.Parameters.AddWithValue("@u", updated);
+                                        cmd.ExecuteNonQuery();
+                                    }
+                                }
+                                applied = true;
+                            }
+                        }
+                    }
+                    else if (cloud == "zaib_bank_transactions")
+                    {
+                        string updated = payload.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
+                        bool deleted = payload["deleted_at"] != null && payload["deleted_at"].Type != JTokenType.Null;
+                        if (!ShouldApply(con, "BankTransactions", syncId, updated, deleted, payload.Value<string>("device_id")))
+                            applied = false;
+                        else if (deleted) { ApplyRemoteDelete(con, "BankTransactions", syncId); applied = true; }
+                        else
+                        {
+                            string cSync = payload.Value<string>("customer_sync_id");
+                            string dSync = payload.Value<string>("dealer_sync_id");
+                            object cid = LocalIdBySync(con, "AddCustomer", "id", cSync);
+                            object did = LocalIdBySync(con, "AddDealer", "Did", dSync);
+                            if ((!string.IsNullOrWhiteSpace(cSync) && (cid == null || cid == DBNull.Value)) ||
+                                (!string.IsNullOrWhiteSpace(dSync) && (did == null || did == DBNull.Value)))
+                                applied = false;
+                            else
+                            {
+                                using (var chk = new SQLiteCommand("SELECT Id FROM BankTransactions WHERE SyncId=@s", con))
+                                {
+                                    chk.Parameters.AddWithValue("@s", syncId);
+                                    var exists = chk.ExecuteScalar();
+                                    string sql = exists == null
+                                        ? "INSERT INTO BankTransactions(TransactionDate,TransactionType,CustomerId,DealerId,Amount,Note,BankName,SyncId,UpdatedAt,SyncDirty) VALUES(@TransactionDate,@TransactionType,@CustomerId,@DealerId,@Amount,@Note,@BankName,@s,@u,0)"
+                                        : "UPDATE BankTransactions SET TransactionDate=@TransactionDate,TransactionType=@TransactionType,CustomerId=@CustomerId,DealerId=@DealerId,Amount=@Amount,Note=@Note,BankName=@BankName,UpdatedAt=@u,SyncDirty=0 WHERE SyncId=@s";
+                                    using (var cmd = new SQLiteCommand(sql, con))
+                                    {
+                                        cmd.Parameters.AddWithValue("@TransactionDate", payload.Value<string>("transaction_date") ?? "");
+                                        cmd.Parameters.AddWithValue("@TransactionType", payload.Value<string>("transaction_type") ?? "");
+                                        cmd.Parameters.AddWithValue("@CustomerId", cid ?? (object)DBNull.Value);
+                                        cmd.Parameters.AddWithValue("@DealerId", did ?? (object)DBNull.Value);
+                                        cmd.Parameters.AddWithValue("@Amount", payload.Value<double?>("amount") ?? 0);
+                                        cmd.Parameters.AddWithValue("@Note", payload.Value<string>("note") ?? "");
+                                        cmd.Parameters.AddWithValue("@BankName", payload.Value<string>("bank_name") ?? "");
+                                        cmd.Parameters.AddWithValue("@s", syncId);
+                                        cmd.Parameters.AddWithValue("@u", updated);
+                                        cmd.ExecuteNonQuery();
+                                    }
+                                }
+                                applied = true;
+                            }
+                        }
+                    }
+                    else if (cloud == "zaib_customers" || cloud == "zaib_dealers" || cloud == "zaib_expenses")
+                    {
+                        // Re-queue via StageRemote keep — Flush will retry next pass after parents ready.
+                        LogFail(con, "flush:deferred:" + cloud, syncId, new Exception("parent/table flush deferred — kept staged"));
+                        applied = false;
+                    }
                     else
                     {
-                        applied = true;
+                        LogFail(con, "flush:unknown:" + cloud, syncId, new Exception("unknown staged table — kept"));
+                        applied = false;
                     }
                     if (applied)
                     {
@@ -1564,7 +1883,15 @@ END;";
             string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
             bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
             if (!ShouldApply(con, localTable, syncId, updated, deleted, r.Value<string>("device_id")))
-                return true;
+            {
+                // Keep unresolved remotes staged (dirty/tombstone) — do not drop from SyncStagedRemote.
+                if (HasTombstone(con, syncId) || IsSyncDirty(con, localTable, syncId))
+                {
+                    if (r is JObject jo) StageRemote(con, cloudTable, jo);
+                    return false;
+                }
+                return true; // older / lost tie-break — safe to drop stage
+            }
             if (deleted)
             {
                 ApplyRemoteDelete(con, localTable, syncId);

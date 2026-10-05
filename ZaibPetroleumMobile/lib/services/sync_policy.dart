@@ -1,4 +1,17 @@
 /// Pure sync decision helpers (unit-testable; no I/O / secrets).
+///
+/// Conflict rule (documented):
+/// - Pending local SyncDirty / SyncTombstone always protect until upload ack.
+/// - Upload ack succeeds only when returned (updated_at, device_id) matches the
+///   exact payload that was sent (mid-upload edits must not be marked clean).
+/// - Upload conflict (server kept another revision): preserve rejected local
+///   payload for review; fetch server; if local UpdatedAt still equals the
+///   rejected upload version, adopt server and clear dirty; if user edited
+///   mid-upload, keep dirty and stage server for later.
+/// - Soft-deleted SyncIds never resurrect from an ordinary newer live upsert;
+///   restore requires an intentional restore path (not a normal update).
+/// - Pull cursor is (updated_at, sync_id). Unresolved (dirty/parent-missing)
+///   remotes are staged before the cursor advances past them.
 class SyncPolicy {
   SyncPolicy._();
 
@@ -8,37 +21,53 @@ class SyncPolicy {
         DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
   }
 
-  /// Remote soft-delete / live-row apply decision.
-  /// Pending local edits and deletion tombstones always win until uploaded.
-  static bool shouldApplyRemote({
-    required bool rowExists,
-    required bool syncDirty,
-    required bool hasLocalTombstone,
-    required String? localUpdatedAt,
-    required String? remoteUpdatedAt,
-    required String? localDeviceId,
-    required String? remoteDeviceId,
-    required bool remoteDeleted,
+  /// Outcome of a remote upsert acknowledgement.
+  static UploadAck classifyUploadAck({
+    required bool httpOk,
+    required String? responseBody,
+    required String? uploadedUpdatedAt,
+    required String? returnedUpdatedAt,
+    required String? uploadedDeviceId,
+    required String? returnedDeviceId,
+    required bool parseError,
   }) {
-    if (hasLocalTombstone) {
-      // Keep tombstone until push ack; never resurrect from stale live row.
-      return remoteDeleted;
+    if (!httpOk) return UploadAck.failure;
+    if (parseError) return UploadAck.failure;
+    // Empty / missing representation is NOT success — caller must verify or fail.
+    if (responseBody == null || responseBody.trim().isEmpty || responseBody.trim() == '[]') {
+      return UploadAck.failure;
     }
-    if (syncDirty) return false;
+    if (uploadedUpdatedAt == null || uploadedUpdatedAt.isEmpty) return UploadAck.failure;
+    if (returnedUpdatedAt == null || returnedUpdatedAt.isEmpty) return UploadAck.failure;
 
-    if (!rowExists) return true;
+    final sameTs = parseTs(uploadedUpdatedAt).isAtSameMomentAs(parseTs(returnedUpdatedAt));
+    final ud = uploadedDeviceId ?? '';
+    final rd = returnedDeviceId ?? '';
+    final sameDev = ud.isEmpty || rd.isEmpty || ud == rd;
 
-    final local = parseTs(localUpdatedAt);
-    final remote = parseTs(remoteUpdatedAt);
-    final cmp = remote.compareTo(local);
-    if (cmp > 0) return true;
-    if (cmp < 0) return false;
+    if (sameTs && sameDev) return UploadAck.accepted;
+    // Same timestamp+device already accepted; identical retry after accept is duplicate.
+    if (sameTs && ud.isNotEmpty && ud == rd) return UploadAck.duplicate;
+    return UploadAck.conflict;
+  }
 
-    // Equal timestamps: delete wins; else higher device_id wins (deterministic).
-    if (remoteDeleted) return true;
-    final ld = localDeviceId ?? '';
-    final rd = remoteDeviceId ?? '';
-    return rd.compareTo(ld) >= 0;
+  /// Whether a returned row matches the exact uploaded revision.
+  static bool uploadAckMatches({
+    required String? uploadedUpdatedAt,
+    required String? returnedUpdatedAt,
+    required String? uploadedDeviceId,
+    required String? returnedDeviceId,
+  }) {
+    return classifyUploadAck(
+          httpOk: true,
+          responseBody: '[{}]',
+          uploadedUpdatedAt: uploadedUpdatedAt,
+          returnedUpdatedAt: returnedUpdatedAt,
+          uploadedDeviceId: uploadedDeviceId,
+          returnedDeviceId: returnedDeviceId,
+          parseError: false,
+        ) ==
+        UploadAck.accepted;
   }
 
   /// Only acknowledge the exact version that was uploaded.
@@ -55,20 +84,114 @@ class SyncPolicy {
     return parseTs(currentUpdatedAt).isAtSameMomentAs(parseTs(uploadedUpdatedAt));
   }
 
-  /// Upload won on server when returned revision/timestamp matches what we sent.
-  static bool uploadAckMatches({
-    required String? uploadedUpdatedAt,
-    required String? returnedUpdatedAt,
-    required String? uploadedDeviceId,
-    required String? returnedDeviceId,
+  /// Remote soft-delete / live-row apply decision.
+  static bool shouldApplyRemote({
+    required bool rowExists,
+    required bool syncDirty,
+    required bool hasLocalTombstone,
+    required String? localUpdatedAt,
+    required String? remoteUpdatedAt,
+    required String? localDeviceId,
+    required String? remoteDeviceId,
+    required bool remoteDeleted,
   }) {
-    if (uploadedUpdatedAt == null || returnedUpdatedAt == null) return false;
-    if (!parseTs(uploadedUpdatedAt).isAtSameMomentAs(parseTs(returnedUpdatedAt))) {
-      return false;
-    }
-    final ud = uploadedDeviceId ?? '';
-    final rd = returnedDeviceId ?? '';
-    if (ud.isEmpty || rd.isEmpty) return true;
-    return ud == rd;
+    return classifyRemoteApply(
+          rowExists: rowExists,
+          syncDirty: syncDirty,
+          hasLocalTombstone: hasLocalTombstone,
+          localUpdatedAt: localUpdatedAt,
+          remoteUpdatedAt: remoteUpdatedAt,
+          localDeviceId: localDeviceId,
+          remoteDeviceId: remoteDeviceId,
+          remoteDeleted: remoteDeleted,
+        ) ==
+        RemoteApplyDecision.apply;
   }
+
+  static RemoteApplyDecision classifyRemoteApply({
+    required bool rowExists,
+    required bool syncDirty,
+    required bool hasLocalTombstone,
+    required String? localUpdatedAt,
+    required String? remoteUpdatedAt,
+    required String? localDeviceId,
+    required String? remoteDeviceId,
+    required bool remoteDeleted,
+  }) {
+    if (hasLocalTombstone) {
+      // Keep tombstone until push ack; never resurrect from live row.
+      return remoteDeleted ? RemoteApplyDecision.apply : RemoteApplyDecision.skipStage;
+    }
+    if (syncDirty) return RemoteApplyDecision.skipStage;
+
+    if (!rowExists) return RemoteApplyDecision.apply;
+
+    final local = parseTs(localUpdatedAt);
+    final remote = parseTs(remoteUpdatedAt);
+    final cmp = remote.compareTo(local);
+    if (cmp > 0) return RemoteApplyDecision.apply;
+    if (cmp < 0) return RemoteApplyDecision.skipDone;
+
+    // Equal timestamps: delete wins; else higher device_id wins (deterministic).
+    if (remoteDeleted) return RemoteApplyDecision.apply;
+    final ld = localDeviceId ?? '';
+    final rd = remoteDeviceId ?? '';
+    return rd.compareTo(ld) >= 0 ? RemoteApplyDecision.apply : RemoteApplyDecision.skipDone;
+  }
+
+  /// After upload conflict: adopt server only if local still at rejected revision.
+  static ConflictReconcile reconcileRejectedUpload({
+    required String? localUpdatedAtNow,
+    required String? rejectedUploadedUpdatedAt,
+  }) {
+    if (rejectedUploadedUpdatedAt == null || rejectedUploadedUpdatedAt.isEmpty) {
+      return ConflictReconcile.keepLocalDirtyStageServer;
+    }
+    if (localUpdatedAtNow == null || localUpdatedAtNow.isEmpty) {
+      return ConflictReconcile.keepLocalDirtyStageServer;
+    }
+    if (parseTs(localUpdatedAtNow).isAtSameMomentAs(parseTs(rejectedUploadedUpdatedAt))) {
+      return ConflictReconcile.adoptServerClearDirty;
+    }
+    return ConflictReconcile.keepLocalDirtyStageServer;
+  }
+
+  /// Composite pull cursor: updated_at + sync_id (timestamp alone is insufficient).
+  static String encodeCursor(String? updatedAt, String? syncId) {
+    final u = (updatedAt == null || updatedAt.isEmpty) ? '1970-01-01T00:00:00.000Z' : updatedAt;
+    final s = syncId ?? '';
+    return '$u|$s';
+  }
+
+  static (String updatedAt, String syncId) decodeCursor(String? cursor) {
+    if (cursor == null || cursor.isEmpty) {
+      return ('1970-01-01T00:00:00.000Z', '');
+    }
+    final i = cursor.indexOf('|');
+    if (i < 0) return (cursor, '');
+    return (cursor.substring(0, i), cursor.substring(i + 1));
+  }
+
+  static bool cursorLessOrEqual(String updatedAt, String syncId, String cursorUpdated, String cursorSync) {
+    final cmp = parseTs(updatedAt).compareTo(parseTs(cursorUpdated));
+    if (cmp < 0) return true;
+    if (cmp > 0) return false;
+    return syncId.compareTo(cursorSync) <= 0;
+  }
+}
+
+enum UploadAck { accepted, duplicate, conflict, failure }
+
+enum RemoteApplyDecision {
+  /// Apply remote row now.
+  apply,
+  /// Do not apply; keep staged (pending local dirty/tombstone/parent).
+  skipStage,
+  /// Do not apply; safe to forget (older / lost tie-break).
+  skipDone,
+}
+
+enum ConflictReconcile {
+  adoptServerClearDirty,
+  keepLocalDirtyStageServer,
 }

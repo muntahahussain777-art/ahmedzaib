@@ -177,6 +177,18 @@ class PcSchema {
         PRIMARY KEY (CloudTable, SyncId)
       )
     ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncRejectedUpload (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        At TEXT NOT NULL,
+        CloudTable TEXT NOT NULL,
+        SyncId TEXT NOT NULL,
+        LocalUpdatedAt TEXT,
+        PayloadJson TEXT NOT NULL,
+        ServerPayloadJson TEXT,
+        Outcome TEXT NOT NULL
+      )
+    ''');
 
     // Local-only Bul Mal (sync/pull nahi — PC cloud se alag)
     await db.execute('''
