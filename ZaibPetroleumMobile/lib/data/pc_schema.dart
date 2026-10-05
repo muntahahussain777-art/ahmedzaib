@@ -159,6 +159,24 @@ class PcSchema {
         DeletedAt TEXT NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncFailLog (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        At TEXT NOT NULL,
+        Scope TEXT NOT NULL,
+        SyncId TEXT,
+        Message TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncStagedRemote (
+        SyncId TEXT NOT NULL,
+        CloudTable TEXT NOT NULL,
+        PayloadJson TEXT NOT NULL,
+        UpdatedAt TEXT NOT NULL,
+        PRIMARY KEY (CloudTable, SyncId)
+      )
+    ''');
 
     // Local-only Bul Mal (sync/pull nahi — PC cloud se alag)
     await db.execute('''
