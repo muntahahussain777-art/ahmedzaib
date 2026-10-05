@@ -250,7 +250,69 @@ class SyncPolicy {
       result == RemoteApplyResult.applied || result == RemoteApplyResult.safelyAlreadyHandled;
 }
 
-enum UploadAck { accepted, duplicate, conflict, failure }
+enum UploadAck { accepted, duplicate, conflict, deleted, failure, unknown }
+
+/// Structured outcome from zaib_sync_apply RPC.
+class SyncApplyOutcome {
+  SyncApplyOutcome({
+    required this.status,
+    this.serverRev,
+    this.updatedAt,
+    this.deviceId,
+    this.deletedAt,
+    this.row,
+    this.reason,
+    this.idempotent = false,
+  });
+
+  final String status;
+  final int? serverRev;
+  final String? updatedAt;
+  final String? deviceId;
+  final String? deletedAt;
+  final Map<String, dynamic>? row;
+  final String? reason;
+  final bool idempotent;
+
+  UploadAck get ack {
+    switch (status) {
+      case 'accepted':
+        return UploadAck.accepted;
+      case 'duplicate':
+        return UploadAck.duplicate;
+      case 'conflict':
+        return UploadAck.conflict;
+      case 'deleted':
+        return UploadAck.deleted;
+      case 'rejected':
+        return UploadAck.failure;
+      default:
+        return UploadAck.failure;
+    }
+  }
+
+  static SyncApplyOutcome? tryParse(dynamic raw) {
+    if (raw is! Map) return null;
+    final m = Map<String, dynamic>.from(raw);
+    final status = m['status']?.toString();
+    if (status == null || status.isEmpty) return null;
+    Map<String, dynamic>? row;
+    final rowRaw = m['row'];
+    if (rowRaw is Map) row = Map<String, dynamic>.from(rowRaw);
+    return SyncApplyOutcome(
+      status: status,
+      serverRev: m['server_rev'] is int
+          ? m['server_rev'] as int
+          : int.tryParse('${m['server_rev'] ?? ''}'),
+      updatedAt: m['updated_at']?.toString(),
+      deviceId: m['device_id']?.toString(),
+      deletedAt: m['deleted_at']?.toString(),
+      row: row,
+      reason: m['reason']?.toString(),
+      idempotent: m['idempotent'] == true,
+    );
+  }
+}
 
 enum RemoteApplyDecision {
   /// Apply remote row now.

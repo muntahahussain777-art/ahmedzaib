@@ -157,6 +157,7 @@ class PcSchema {
       await _ensureColumn(db, t, 'SyncId', 'TEXT');
       await _ensureColumn(db, t, 'UpdatedAt', 'TEXT');
       await _ensureColumn(db, t, 'SyncDirty', 'INTEGER DEFAULT 1');
+      await _ensureColumn(db, t, 'ServerRev', 'INTEGER');
       try {
         await db.execute(
           'CREATE UNIQUE INDEX IF NOT EXISTS uq_${t}_SyncId ON $t(SyncId) WHERE SyncId IS NOT NULL AND SyncId <> \'\'',

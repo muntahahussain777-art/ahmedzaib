@@ -189,12 +189,14 @@ namespace ZaibPetroleumService.Services
                     DatabaseSchemaManager.EnsureColumn(con, t, "SyncId", "TEXT");
                     DatabaseSchemaManager.EnsureColumn(con, t, "UpdatedAt", "TEXT");
                     DatabaseSchemaManager.EnsureColumn(con, t, "SyncDirty", "INTEGER DEFAULT 1");
+                    DatabaseSchemaManager.EnsureColumn(con, t, "ServerRev", "INTEGER");
                 }
                 if (TableExistsLocal(con, "DealertoDealer"))
                 {
                     DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "SyncId", "TEXT");
                     DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "UpdatedAt", "TEXT");
                     DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "SyncDirty", "INTEGER DEFAULT 1");
+                    DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "ServerRev", "INTEGER");
                     BackfillSyncIds(con, "DealertoDealer", "LedgerID");
                 }
 
@@ -249,8 +251,10 @@ namespace ZaibPetroleumService.Services
                     Note TEXT,
                     UpdatedAt TEXT NOT NULL,
                     SyncDirty INTEGER NOT NULL DEFAULT 1,
-                    DeletedAt TEXT
+                    DeletedAt TEXT,
+                    ServerRev INTEGER
                 );");
+                try { DatabaseSchemaManager.EnsureColumn(con, "SyncDealerBalanceOp", "ServerRev", "INTEGER"); } catch { }
                 Exec(con, @"CREATE TABLE IF NOT EXISTS SyncCheckpoint (
                     CloudTable TEXT PRIMARY KEY,
                     ChangeFeedCursor INTEGER NOT NULL DEFAULT 0
@@ -686,48 +690,101 @@ END;";
             SetBalanceMarkerOnly(con, tx, syncId + ":to", toDealerId, amount, 0);
         }
 
-        private enum UploadAck { Accepted, Duplicate, Conflict, Failure }
+        private enum UploadAck { Accepted, Duplicate, Conflict, Deleted, Failure, Unknown }
 
-        private static async Task<UploadAck> UpsertAsync(string table, object row)
+        private static async Task<UploadAck> UpsertAsync(string table, object row, long? expectedServerRev = null)
         {
             string json = JsonConvert.SerializeObject(row);
             var uploaded = JObject.Parse(json);
+            uploaded.Remove("server_rev");
             string upAt = uploaded.Value<string>("updated_at");
             string upDev = uploaded.Value<string>("device_id");
+            string syncId = uploaded.Value<string>("sync_id");
+            string requestId = StableRequestId(table, syncId, upAt);
+
             try
             {
-                var req = new HttpRequestMessage(HttpMethod.Post, $"{Url}/rest/v1/{table}?on_conflict=sync_id")
+                var outcome = await CallSyncApplyAsync(table, uploaded, expectedServerRev, requestId);
+                if (outcome == null) return UploadAck.Unknown;
+
+                if (string.Equals(outcome.Value<string>("status"), "conflict", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(outcome.Value<string>("reason"), "expected_rev_required", StringComparison.OrdinalIgnoreCase)
+                    && expectedServerRev == null
+                    && outcome["server_rev"] != null && outcome["server_rev"].Type != JTokenType.Null)
                 {
-                    Content = new StringContent(json, Encoding.UTF8, "application/json")
-                };
-                req.Headers.Add("Prefer", "resolution=merge-duplicates,return=representation");
-                var res = await Http.SendAsync(req);
-                if (!res.IsSuccessStatusCode) return UploadAck.Failure;
-                string body = await res.Content.ReadAsStringAsync();
-                if (string.IsNullOrWhiteSpace(body) || body == "[]") return UploadAck.Failure;
+                    long learned = outcome.Value<long?>("server_rev") ?? 0;
+                    string retryId = StableRequestId(table, syncId, upAt + "|occ1");
+                    outcome = await CallSyncApplyAsync(table, uploaded, learned, retryId) ?? outcome;
+                }
+
+                // Stash for FinishUpload
+                uploaded["_ack_server_rev"] = outcome["server_rev"];
+                uploaded["_ack_row"] = outcome["row"];
+                uploaded["_ack_status"] = outcome["status"];
+                // Mutate original serialization bag via side channel dictionary
+                LastUpsertMeta[syncId ?? ""] = uploaded;
+
+                string status = outcome.Value<string>("status") ?? "";
+                switch (status.ToLowerInvariant())
+                {
+                    case "accepted": return UploadAck.Accepted;
+                    case "duplicate": return UploadAck.Duplicate;
+                    case "conflict": return UploadAck.Conflict;
+                    case "deleted": return UploadAck.Deleted;
+                    case "rejected": return UploadAck.Failure;
+                    default: return UploadAck.Failure;
+                }
+            }
+            catch (Exception ex)
+            {
                 try
                 {
-                    var arr = JArray.Parse(body);
-                    if (arr.Count == 0) return UploadAck.Failure;
-                    var returned = arr[0] as JObject;
-                    string retAt = returned?.Value<string>("updated_at");
-                    string retDev = returned?.Value<string>("device_id");
-                    if (string.IsNullOrWhiteSpace(upAt) || string.IsNullOrWhiteSpace(retAt)) return UploadAck.Failure;
-                    DateTime u = DateTime.TryParse(upAt, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
-                    DateTime r = DateTime.TryParse(retAt, out var rt) ? rt.ToUniversalTime() : DateTime.MinValue;
-                    if (u == r && (string.IsNullOrEmpty(upDev) || string.IsNullOrEmpty(retDev) || upDev == retDev))
-                        return UploadAck.Accepted;
-                    return UploadAck.Conflict;
+                    using (var con = new SQLiteConnection(projectconnection.ConnectionString))
+                    {
+                        con.Open();
+                        LogFail(con, "rpc:" + table, syncId, ex);
+                    }
                 }
-                catch
-                {
-                    return UploadAck.Failure;
-                }
+                catch { }
+                return UploadAck.Unknown;
             }
-            catch
+        }
+
+        private static readonly Dictionary<string, JObject> LastUpsertMeta =
+            new Dictionary<string, JObject>(StringComparer.OrdinalIgnoreCase);
+
+        private static string StableRequestId(string table, string syncId, string updatedAt)
+        {
+            // Deterministic GUID from table|sync|updated for idempotent retries.
+            using (var md5 = System.Security.Cryptography.MD5.Create())
             {
-                return UploadAck.Failure;
+                byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(table + "|" + (syncId ?? "") + "|" + (updatedAt ?? "")));
+                return new Guid(hash).ToString();
             }
+        }
+
+        private static async Task<JObject> CallSyncApplyAsync(string table, JObject payload, long? expectedRev, string requestId)
+        {
+            var body = new JObject
+            {
+                ["p_table"] = table,
+                ["p_payload"] = payload,
+                ["p_expected_rev"] = expectedRev.HasValue ? (JToken)expectedRev.Value : JValue.CreateNull(),
+                ["p_request_id"] = requestId,
+                ["p_allow_restore"] = false
+            };
+            var req = new HttpRequestMessage(HttpMethod.Post, $"{Url}/rest/v1/rpc/zaib_sync_apply")
+            {
+                Content = new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json")
+            };
+            var res = await Http.SendAsync(req);
+            string resp = await res.Content.ReadAsStringAsync();
+            if (!res.IsSuccessStatusCode) return null;
+            if (string.IsNullOrWhiteSpace(resp)) return null;
+            var token = JToken.Parse(resp);
+            if (token is JObject jo) return jo;
+            if (token is JArray arr && arr.Count > 0 && arr[0] is JObject first) return first;
+            return null;
         }
 
         private static async Task FinishUpload(
@@ -741,29 +798,76 @@ END;";
             string uploadedJson,
             UploadAck ack)
         {
+            JObject meta = null;
+            if (!string.IsNullOrWhiteSpace(syncId) && LastUpsertMeta.TryGetValue(syncId, out var m))
+                meta = m;
+            long? ackRev = meta?["_ack_server_rev"]?.Value<long?>();
+            if (ackRev.HasValue && ackRev.Value > 0)
+                StoreServerRev(con, localTable, pk, id, ackRev.Value);
+
             if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate)
             {
                 MarkCleanIfVersion(con, localTable, pk, id, syncId, uploadedUpdatedAt);
                 return;
             }
-            if (ack == UploadAck.Failure)
+            if (ack == UploadAck.Failure || ack == UploadAck.Unknown)
             {
-                LogFail(con, "upload:failure:" + cloudTable, syncId, new Exception("empty/invalid ack or transport failure"));
+                LogFail(con, "upload:" + ack + ":" + cloudTable, syncId,
+                    new Exception(ack == UploadAck.Unknown
+                        ? "unknown commit outcome — keep dirty; retry same request_id"
+                        : "empty/invalid ack or transport failure"));
                 return;
             }
 
-            string serverJson = null;
+            if (ack == UploadAck.Deleted)
+            {
+                string serverJson = meta?["_ack_row"]?.ToString(Formatting.None);
+                try
+                {
+                    using (var cmd = new SQLiteCommand(
+                        @"INSERT INTO SyncRejectedUpload(At,CloudTable,SyncId,LocalUpdatedAt,PayloadJson,ServerPayloadJson,Outcome)
+                          VALUES(@a,@t,@s,@u,@p,@sp,@o)", con))
+                    {
+                        cmd.Parameters.AddWithValue("@a", DateTime.UtcNow.ToString("o"));
+                        cmd.Parameters.AddWithValue("@t", cloudTable);
+                        cmd.Parameters.AddWithValue("@s", syncId);
+                        cmd.Parameters.AddWithValue("@u", (object)uploadedUpdatedAt ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@p", uploadedJson ?? "{}");
+                        cmd.Parameters.AddWithValue("@sp", (object)serverJson ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@o", "serverDeleted");
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+                if (meta?["_ack_row"] is JObject joDel)
+                    StageRemote(con, cloudTable, joDel);
+                return;
+            }
+
+            string serverJson2 = null;
             try
             {
-                var res = await Http.GetAsync($"{Url}/rest/v1/{cloudTable}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=*&limit=1");
-                if (res.IsSuccessStatusCode)
+                if (meta?["_ack_row"] is JObject joAck)
                 {
-                    var body = await res.Content.ReadAsStringAsync();
-                    var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
-                    if (arr.Count > 0 && arr[0] is JObject jo)
+                    serverJson2 = joAck.ToString(Formatting.None);
+                    StageRemote(con, cloudTable, joAck);
+                    long? srv = joAck.Value<long?>("server_rev");
+                    if (srv.HasValue) StoreServerRev(con, localTable, pk, id, srv.Value);
+                }
+                else
+                {
+                    var res = await Http.GetAsync($"{Url}/rest/v1/{cloudTable}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=*&limit=1");
+                    if (res.IsSuccessStatusCode)
                     {
-                        serverJson = jo.ToString(Formatting.None);
-                        StageRemote(con, cloudTable, jo);
+                        var body = await res.Content.ReadAsStringAsync();
+                        var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
+                        if (arr.Count > 0 && arr[0] is JObject jo)
+                        {
+                            serverJson2 = jo.ToString(Formatting.None);
+                            StageRemote(con, cloudTable, jo);
+                            long? srv = jo.Value<long?>("server_rev");
+                            if (srv.HasValue) StoreServerRev(con, localTable, pk, id, srv.Value);
+                        }
                     }
                 }
             }
@@ -790,7 +894,7 @@ END;";
                     cmd.Parameters.AddWithValue("@s", syncId);
                     cmd.Parameters.AddWithValue("@u", (object)uploadedUpdatedAt ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("@p", uploadedJson ?? "{}");
-                    cmd.Parameters.AddWithValue("@sp", (object)serverJson ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@sp", (object)serverJson2 ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("@o", outcome);
                     cmd.ExecuteNonQuery();
                 }
@@ -799,14 +903,45 @@ END;";
 
             if (sameVersion)
             {
-                using (var u = new SQLiteCommand(
+                using (var cmd = new SQLiteCommand(
                     $"UPDATE {localTable} SET SyncDirty=0 WHERE {pk}=@id AND UpdatedAt=@u", con))
                 {
-                    u.Parameters.AddWithValue("@id", id);
-                    u.Parameters.AddWithValue("@u", uploadedUpdatedAt);
-                    u.ExecuteNonQuery();
+                    cmd.Parameters.AddWithValue("@id", id);
+                    cmd.Parameters.AddWithValue("@u", uploadedUpdatedAt ?? "");
+                    cmd.ExecuteNonQuery();
                 }
             }
+        }
+
+        private static void StoreServerRev(SQLiteConnection con, string localTable, string pk, object id, long rev)
+        {
+            if (rev <= 0 || id == null || id == DBNull.Value) return;
+            try
+            {
+                using (var cmd = new SQLiteCommand($"UPDATE {localTable} SET ServerRev=@r WHERE {pk}=@id", con))
+                {
+                    cmd.Parameters.AddWithValue("@r", rev);
+                    cmd.Parameters.AddWithValue("@id", id);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch { }
+        }
+
+        private static long? ReadServerRev(SQLiteConnection con, string localTable, string pk, object id)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand($"SELECT ServerRev FROM {localTable} WHERE {pk}=@id LIMIT 1", con))
+                {
+                    cmd.Parameters.AddWithValue("@id", id);
+                    var v = cmd.ExecuteScalar();
+                    if (v == null || v == DBNull.Value) return null;
+                    long n = Convert.ToInt64(v);
+                    return n <= 0 ? (long?)null : n;
+                }
+            }
+            catch { return null; }
         }
 
         private static long GetChangeFeedCursor(SQLiteConnection con)
@@ -1503,8 +1638,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_customers", new
-                    {
+                    var ack = await UpsertAsync("zaib_customers", new {
                         sync_id = syncId,
                         local_id = r["id"],
                         name = Convert.ToString(r["Name"]) ?? "",
@@ -1513,7 +1647,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "AddCustomer", "id", r["id"]));
                     await FinishUpload(con, "zaib_customers", "AddCustomer", "id", r["id"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_customers", syncId, ex); }
@@ -1529,8 +1663,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealers", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealers", new {
                         sync_id = syncId,
                         local_id = r["Did"],
                         dealer_name = Convert.ToString(r["DealerName"]) ?? "",
@@ -1540,7 +1673,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "AddDealer", "Did", r["Did"]));
                     await FinishUpload(con, "zaib_dealers", "AddDealer", "Did", r["Did"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealers", syncId, ex); }
@@ -1561,8 +1694,7 @@ END;";
                 string deletedAt = r["DeletedAt"] == DBNull.Value ? null : Convert.ToString(r["DeletedAt"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealer_balance_ops", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealer_balance_ops", new {
                         sync_id = syncId,
                         dealer_sync_id = dealerSync,
                         dd_delta = ToD(r["DdDelta"]),
@@ -1574,7 +1706,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = deletedAt,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "SyncDealerBalanceOp", "SyncId", syncId));
                     await FinishUpload(con, "zaib_dealer_balance_ops", "SyncDealerBalanceOp", "SyncId", syncId, syncId, updatedAt,
                         JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
@@ -1603,8 +1735,7 @@ END;";
                 }
                 try
                 {
-                    var ack = await UpsertAsync("zaib_petrol_entries", new
-                    {
+                    var ack = await UpsertAsync("zaib_petrol_entries", new {
                         sync_id = syncId,
                         local_id = r["pid"],
                         customer_sync_id = custSync,
@@ -1624,7 +1755,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "PetrolAdd", "pid", r["pid"]));
                     await FinishUpload(con, "zaib_petrol_entries", "PetrolAdd", "pid", r["pid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_petrol_entries", syncId, ex); }
@@ -1642,8 +1773,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealer_payouts", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealer_payouts", new {
                         sync_id = syncId,
                         local_id = r["LedgerID"],
                         dealer_sync_id = dSync,
@@ -1654,7 +1784,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "DieselLedgerCredit", "LedgerID", r["LedgerID"]));
                     await FinishUpload(con, "zaib_dealer_payouts", "DieselLedgerCredit", "LedgerID", r["LedgerID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_payouts", syncId, ex); }
@@ -1672,8 +1802,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealer_purchases", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealer_purchases", new {
                         sync_id = syncId,
                         local_id = r["Sid"],
                         dealer_sync_id = dSync,
@@ -1686,7 +1815,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "AddStock", "Sid", r["Sid"]));
                     await FinishUpload(con, "zaib_dealer_purchases", "AddStock", "Sid", r["Sid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_purchases", syncId, ex); }
@@ -1704,8 +1833,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealer_direct", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealer_direct", new {
                         sync_id = syncId,
                         local_id = r["LedgerID"],
                         dealer_sync_id = dSync,
@@ -1716,7 +1844,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "DieselLedgerDebit", "LedgerID", r["LedgerID"]));
                     await FinishUpload(con, "zaib_dealer_direct", "DieselLedgerDebit", "LedgerID", r["LedgerID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_dealer_direct", syncId, ex); }
@@ -1734,8 +1862,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["SDid"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_stock_diesel", new
-                    {
+                    var ack = await UpsertAsync("zaib_stock_diesel", new {
                         sync_id = syncId,
                         local_id = r["SID"],
                         dealer_sync_id = dSync,
@@ -1750,7 +1877,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "StockDiesel", "SID", r["SID"]));
                     await FinishUpload(con, "zaib_stock_diesel", "StockDiesel", "SID", r["SID"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_stock_diesel", syncId, ex); }
@@ -1770,8 +1897,7 @@ END;";
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_bank_transactions", new
-                    {
+                    var ack = await UpsertAsync("zaib_bank_transactions", new {
                         sync_id = syncId,
                         local_id = r["Id"],
                         transaction_date = Convert.ToString(r["TransactionDate"]) ?? "",
@@ -1786,7 +1912,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "BankTransactions", "Id", r["Id"]));
                     await FinishUpload(con, "zaib_bank_transactions", "BankTransactions", "Id", r["Id"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_bank_transactions", syncId, ex); }
@@ -1803,8 +1929,7 @@ END;";
                 string updatedAt = RowUpdatedAt(r);
                 try
                 {
-                    var ack = await UpsertAsync("zaib_expenses", new
-                    {
+                    var ack = await UpsertAsync("zaib_expenses", new {
                         sync_id = syncId,
                         local_id = r["sid"],
                         name = Convert.ToString(r["Name"]) ?? "",
@@ -1815,7 +1940,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "Expensetable", "sid", r["sid"]));
                     await FinishUpload(con, "zaib_expenses", "Expensetable", "sid", r["sid"], syncId, updatedAt, JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }
                 catch (Exception ex) { LogFail(con, "push:zaib_expenses", syncId, ex); }
@@ -1837,8 +1962,7 @@ END;";
                 if (string.IsNullOrWhiteSpace(fromSync) || string.IsNullOrWhiteSpace(toSync)) continue;
                 try
                 {
-                    var ack = await UpsertAsync("zaib_dealer_transfers", new
-                    {
+                    var ack = await UpsertAsync("zaib_dealer_transfers", new {
                         sync_id = syncId,
                         local_id = r["LedgerID"],
                         from_dealer_sync_id = fromSync,
@@ -1849,7 +1973,7 @@ END;";
                         updated_at = updatedAt,
                         deleted_at = (string)null,
                         device_id = _deviceId
-                    });
+                    }, ReadServerRev(con, "DealertoDealer", "LedgerID", r["LedgerID"]));
                     await FinishUpload(con, "zaib_dealer_transfers", "DealertoDealer", "LedgerID", r["LedgerID"], syncId, updatedAt,
                         JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
                 }

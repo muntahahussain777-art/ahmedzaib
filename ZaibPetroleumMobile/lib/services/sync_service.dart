@@ -258,38 +258,98 @@ class SyncService {
     return dirtyInt == 0;
   }
 
-  Future<UploadAck> _upsertAck(String table, Map<String, dynamic> row) async {
+  Future<UploadAck> _upsertAck(
+    String table,
+    Map<String, dynamic> row, {
+    int? expectedServerRev,
+    String? requestId,
+  }) async {
     final uploadedAt = row['updated_at']?.toString();
     final uploadedDevice = row['device_id']?.toString();
-    try {
-      final raw = await _table(table)
-          .upsert(row, onConflict: 'sync_id')
-          .select('sync_id, updated_at, device_id, deleted_at')
-          .timeout(_httpTimeout);
-      if (raw.isEmpty) {
-        return SyncPolicy.classifyUploadAck(
-          httpOk: true,
-          responseBody: '[]',
-          uploadedUpdatedAt: uploadedAt,
-          returnedUpdatedAt: null,
-          uploadedDeviceId: uploadedDevice,
-          returnedDeviceId: null,
-          parseError: false,
-        );
+    final syncId = row['sync_id']?.toString();
+    final payload = Map<String, dynamic>.from(row)..remove('server_rev');
+    final reqId = requestId ??
+        (syncId != null && uploadedAt != null
+            ? const Uuid().v5(Namespace.url.value, '$table|$syncId|$uploadedAt')
+            : const Uuid().v4());
+
+    Future<SyncApplyOutcome?> callRpc(int? expected) async {
+      try {
+        final raw = await _client
+            .rpc('zaib_sync_apply', params: {
+              'p_table': table,
+              'p_payload': payload,
+              'p_expected_rev': expected,
+              'p_request_id': reqId,
+              'p_allow_restore': false,
+            })
+            .timeout(_httpTimeout);
+        return SyncApplyOutcome.tryParse(raw);
+      } catch (e) {
+        await _logFail('rpc:$table', syncId, e);
+        return null;
       }
-      final returned = Map<String, dynamic>.from(raw.first);
-      return SyncPolicy.classifyUploadAck(
-        httpOk: true,
-        responseBody: jsonEncode(raw),
-        uploadedUpdatedAt: uploadedAt,
-        returnedUpdatedAt: returned['updated_at']?.toString(),
-        uploadedDeviceId: uploadedDevice,
-        returnedDeviceId: returned['device_id']?.toString(),
-        parseError: false,
-      );
+    }
+
+    try {
+      var outcome = await callRpc(expectedServerRev);
+      if (outcome == null) return UploadAck.unknown;
+
+      // First push after upgrade: learn server_rev then retry once with OCC.
+      if (outcome.status == 'conflict' &&
+          outcome.reason == 'expected_rev_required' &&
+          outcome.serverRev != null &&
+          expectedServerRev == null) {
+        final retryId = const Uuid().v5(Namespace.url.value, '$table|$syncId|$uploadedAt|occ1');
+        try {
+          final raw = await _client
+              .rpc('zaib_sync_apply', params: {
+                'p_table': table,
+                'p_payload': payload,
+                'p_expected_rev': outcome.serverRev,
+                'p_request_id': retryId,
+                'p_allow_restore': false,
+              })
+              .timeout(_httpTimeout);
+          outcome = SyncApplyOutcome.tryParse(raw) ?? outcome;
+        } catch (e) {
+          await _logFail('rpc-retry:$table', syncId, e);
+          return UploadAck.unknown;
+        }
+      }
+
+      // Stash last outcome metadata on the row map for callers (server_rev).
+      if (outcome.serverRev != null) {
+        row['_ack_server_rev'] = outcome.serverRev;
+      }
+      if (outcome.row != null) {
+        row['_ack_row'] = outcome.row;
+      }
+      row['_ack_status'] = outcome.status;
+
+      final ack = outcome.ack;
+      if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
+        // Still require exact uploaded revision match when representation present.
+        if (outcome.updatedAt != null &&
+            uploadedAt != null &&
+            !SyncPolicy.uploadAckMatches(
+              uploadedUpdatedAt: uploadedAt,
+              returnedUpdatedAt: outcome.updatedAt,
+              uploadedDeviceId: uploadedDevice,
+              returnedDeviceId: outcome.deviceId,
+            ) &&
+            ack == UploadAck.accepted &&
+            !outcome.idempotent) {
+          // Soft-delete / server may normalize timestamps; trust RPC status for deletes.
+          if (payload['deleted_at'] == null) {
+            return UploadAck.conflict;
+          }
+        }
+      }
+      return ack;
     } catch (e) {
-      await _logFail('upsert:$table', row['sync_id']?.toString(), e);
-      return UploadAck.failure;
+      await _logFail('upsert:$table', syncId, e);
+      return UploadAck.unknown;
     }
   }
 
@@ -305,26 +365,63 @@ class SyncService {
     required Map<String, dynamic> uploadedRow,
     required UploadAck ack,
   }) async {
+    final ackRev = uploadedRow['_ack_server_rev'];
+    if (ackRev != null) {
+      await _storeServerRev(db, localTable, pkCol, pk, _asInt(ackRev));
+    }
+
     if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
       await _markCleanIfVersion(db, localTable, pkCol, pk, syncId, uploadedUpdatedAt);
       return;
     }
-    if (ack == UploadAck.failure) {
-      await _logFail('upload:failure:$cloudTable', syncId, 'empty/invalid ack or transport failure');
+    if (ack == UploadAck.failure || ack == UploadAck.unknown) {
+      await _logFail(
+        'upload:${ack.name}:$cloudTable',
+        syncId,
+        ack == UploadAck.unknown
+            ? 'unknown commit outcome — keep dirty; retry with same request_id'
+            : 'empty/invalid ack or transport failure',
+      );
+      return;
+    }
+
+    if (ack == UploadAck.deleted) {
+      // Server says SyncId is deleted — keep local tombstone durable until exact ack.
+      // Do not resurrect; stage server evidence; clear dirty only if local still at uploaded version
+      // and a matching tombstone/delete intent exists.
+      final server = uploadedRow['_ack_row'] is Map
+          ? Map<String, dynamic>.from(uploadedRow['_ack_row'] as Map)
+          : null;
+      await db.insert('SyncRejectedUpload', {
+        'At': SyncMeta.nowIso(),
+        'CloudTable': cloudTable,
+        'SyncId': syncId,
+        'LocalUpdatedAt': uploadedUpdatedAt,
+        'PayloadJson': jsonEncode(uploadedRow),
+        'ServerPayloadJson': server == null ? null : jsonEncode(server),
+        'Outcome': 'serverDeleted',
+      });
+      if (server != null) await _stageRemote(db, cloudTable, server);
+      // If this was a tombstone push, leave tombstone; otherwise keep dirty for review.
       return;
     }
 
     // conflict
     Map<String, dynamic>? server;
-    try {
-      final raw = await _table(cloudTable)
-          .select()
-          .eq('sync_id', syncId)
-          .limit(1)
-          .timeout(_httpTimeout);
-      if (raw.isNotEmpty) server = Map<String, dynamic>.from(raw.first);
-    } catch (e) {
-      await _logFail('upload:conflict-fetch:$cloudTable', syncId, e);
+    final staged = uploadedRow['_ack_row'];
+    if (staged is Map) {
+      server = Map<String, dynamic>.from(staged);
+    } else {
+      try {
+        final raw = await _table(cloudTable)
+            .select()
+            .eq('sync_id', syncId)
+            .limit(1)
+            .timeout(_httpTimeout);
+        if (raw.isNotEmpty) server = Map<String, dynamic>.from(raw.first);
+      } catch (e) {
+        await _logFail('upload:conflict-fetch:$cloudTable', syncId, e);
+      }
     }
 
     final rows = await db.query(
@@ -352,27 +449,37 @@ class SyncService {
 
     if (server != null) {
       await _stageRemote(db, cloudTable, server);
+      final srv = server['server_rev'];
+      if (srv != null) await _storeServerRev(db, localTable, pkCol, pk, _asInt(srv));
     }
 
     if (action == ConflictReconcile.adoptServerClearDirty && server != null) {
-      // Exact rejected version still local - adopt authoritative server, clear dirty.
       await db.update(
         localTable,
         {'SyncDirty': 0},
         where: '$pkCol = ? AND UpdatedAt = ?',
         whereArgs: [pk, uploadedUpdatedAt],
       );
-      // Apply staged immediately when possible (same pass flush will also try).
     }
-    // Mid-upload edit: keep dirty; server stays staged until local uploads cleanly.
+  }
+
+  Future<void> _storeServerRev(DatabaseExecutor db, String table, String pkCol, Object pk, int rev) async {
+    if (rev <= 0) return;
+    try {
+      await db.update(table, {'ServerRev': rev}, where: '$pkCol = ?', whereArgs: [pk]);
+    } catch (_) {}
   }
 
   Future<void> _upsertLocal(
     DatabaseExecutor db,
     String table,
     String syncId,
-    Map<String, Object?> map,
-  ) async {
+    Map<String, Object?> map, {
+    Map<String, dynamic>? remoteRow,
+  }) async {
+    if (remoteRow != null && remoteRow['server_rev'] != null) {
+      map['ServerRev'] = _asInt(remoteRow['server_rev']);
+    }
     try {
       await SyncLocalUpsert.upsertBySyncId(db, table, syncId, map);
     } catch (e) {
@@ -509,7 +616,7 @@ class SyncService {
       final syncId = (r['SyncId']?.toString().isNotEmpty == true) ? r['SyncId'].toString() : SyncMeta.newId();
       final updatedAt = (r['UpdatedAt']?.toString().isNotEmpty == true) ? r['UpdatedAt'].toString() : SyncMeta.nowIso();
       try {
-        final ack = await _upsertAck('zaib_customers', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['id'],
           'name': r['Name'] ?? '',
@@ -518,7 +625,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_customers', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_customers',
@@ -527,11 +636,7 @@ class SyncService {
           pk: r['id']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -546,7 +651,7 @@ class SyncService {
       final syncId = (r['SyncId']?.toString().isNotEmpty == true) ? r['SyncId'].toString() : SyncMeta.newId();
       final updatedAt = (r['UpdatedAt']?.toString().isNotEmpty == true) ? r['UpdatedAt'].toString() : SyncMeta.nowIso();
       try {
-        final ack = await _upsertAck('zaib_dealers', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['Did'],
           'dealer_name': r['DealerName'] ?? '',
@@ -556,7 +661,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_dealers', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_dealers',
@@ -565,11 +672,7 @@ class SyncService {
           pk: r['Did']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -591,7 +694,7 @@ class SyncService {
         if (c.isNotEmpty) customerName = c.first['Name']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_petrol_entries', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['pid'],
           'customer_sync_id': custSync,
@@ -611,7 +714,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_petrol_entries', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_petrol_entries',
@@ -620,11 +725,7 @@ class SyncService {
           pk: r['pid']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -646,7 +747,7 @@ class SyncService {
         if (d.isNotEmpty) dealerName = d.first['DealerName']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_dealer_payouts', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['LedgerID'],
           'dealer_sync_id': dSync,
@@ -657,7 +758,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_dealer_payouts', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_dealer_payouts',
@@ -666,11 +769,7 @@ class SyncService {
           pk: r['LedgerID']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -692,7 +791,7 @@ class SyncService {
         if (d.isNotEmpty) dealerName = d.first['DealerName']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_dealer_purchases', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['Sid'],
           'dealer_sync_id': dSync,
@@ -705,7 +804,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_dealer_purchases', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_dealer_purchases',
@@ -714,11 +815,7 @@ class SyncService {
           pk: r['Sid']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -740,7 +837,7 @@ class SyncService {
         if (d.isNotEmpty) dealerName = d.first['DealerName']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_dealer_direct', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['LedgerID'],
           'dealer_sync_id': dSync,
@@ -751,7 +848,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_dealer_direct', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_dealer_direct',
@@ -760,11 +859,7 @@ class SyncService {
           pk: r['LedgerID']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -786,7 +881,7 @@ class SyncService {
         if (d.isNotEmpty) dealerName = d.first['DealerName']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_stock_diesel', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['SID'],
           'dealer_sync_id': dSync,
@@ -801,7 +896,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_stock_diesel', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_stock_diesel',
@@ -810,11 +907,7 @@ class SyncService {
           pk: r['SID']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -843,7 +936,7 @@ class SyncService {
         if (d.isNotEmpty) dealerName = d.first['DealerName']?.toString() ?? '';
       }
       try {
-        final ack = await _upsertAck('zaib_bank_transactions', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['Id'],
           'transaction_date': r['TransactionDate'] ?? '',
@@ -858,7 +951,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_bank_transactions', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_bank_transactions',
@@ -867,11 +962,7 @@ class SyncService {
           pk: r['Id']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -886,7 +977,7 @@ class SyncService {
       final syncId = (r['SyncId']?.toString().isNotEmpty == true) ? r['SyncId'].toString() : SyncMeta.newId();
       final updatedAt = (r['UpdatedAt']?.toString().isNotEmpty == true) ? r['UpdatedAt'].toString() : SyncMeta.nowIso();
       try {
-        final ack = await _upsertAck('zaib_expenses', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['sid'],
           'name': r['Name'] ?? '',
@@ -897,7 +988,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_expenses', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_expenses',
@@ -906,11 +999,7 @@ class SyncService {
           pk: r['sid']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {
@@ -926,7 +1015,7 @@ class SyncService {
       if (syncId.isEmpty) continue;
       final updatedAt = (r['UpdatedAt']?.toString().isNotEmpty == true) ? r['UpdatedAt'].toString() : SyncMeta.nowIso();
       try {
-        final ack = await _upsertAck('zaib_dealer_balance_ops', {
+        final payload = {
           'sync_id': syncId,
           'dealer_sync_id': r['DealerSyncId'],
           'dd_delta': r['DdDelta'] ?? 0,
@@ -938,7 +1027,21 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck(
+          'zaib_dealer_balance_ops',
+          payload,
+          expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev,
+        );
+        if (payload['_ack_server_rev'] != null) {
+          await db.update(
+            'SyncDealerBalanceOp',
+            {'ServerRev': _asInt(payload['_ack_server_rev'])},
+            where: 'SyncId = ?',
+            whereArgs: [syncId],
+          );
+        }
         if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
           final still = await db.query(
             'SyncDealerBalanceOp',
@@ -966,13 +1069,17 @@ class SyncService {
       if (table.isEmpty || syncId.isEmpty) continue;
       final deletedAt = r['DeletedAt']?.toString() ?? SyncMeta.nowIso();
       try {
-        final ack = await _upsertAck(table, {
+        final payload = {
           'sync_id': syncId,
           'updated_at': deletedAt,
           'deleted_at': deletedAt,
           'device_id': deviceId,
-        });
-        if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
+        };
+        // Tombstones: expected_rev unknown locally — null then OCC learn/retry inside _upsertAck.
+        final ack = await _upsertAck(table, payload);
+        if (ack == UploadAck.accepted ||
+            ack == UploadAck.duplicate ||
+            ack == UploadAck.deleted) {
           await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
         } else if (ack == UploadAck.conflict) {
           try {
@@ -982,6 +1089,7 @@ class SyncService {
             }
           } catch (_) {}
         }
+        // unknown/failure: keep tombstone durable for retry
       } catch (e) {
         await _logFail('push:tombstone:$table', syncId, e);
       }
@@ -1271,7 +1379,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1305,7 +1413,7 @@ class SyncService {
         'SyncId': syncId,
         'UpdatedAt': updated,
         'SyncDirty': 0,
-      });
+      }, remoteRow: r);
       return RemoteApplyResult.applied;
     }
     await _upsertLocal(db, 'AddDealer', syncId, {
@@ -1316,7 +1424,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1364,7 +1472,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1403,7 +1511,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     await DealerBalanceApply.reconcile(
       db: db,
       sourceSyncId: syncId,
@@ -1455,7 +1563,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     final dd = _asDouble(r['add_diesel']) * _asDouble(r['rate']);
     await DealerBalanceApply.reconcile(
       db: db,
@@ -1504,7 +1612,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     await DealerBalanceApply.reconcile(
       db: db,
       sourceSyncId: syncId,
@@ -1556,7 +1664,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1601,7 +1709,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1635,7 +1743,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     return RemoteApplyResult.applied;
   }
 
@@ -1744,7 +1852,7 @@ class SyncService {
       'SyncId': syncId,
       'UpdatedAt': updated,
       'SyncDirty': 0,
-    });
+    }, remoteRow: r);
     await DealerBalanceApply.reconcile(
       db: db,
       sourceSyncId: '$syncId:from',
@@ -1776,7 +1884,7 @@ class SyncService {
       if (r['FirstDealer'] != null && (fromSync == null || fromSync.isEmpty)) continue;
       if (r['SecondDealer'] != null && (toSync == null || toSync.isEmpty)) continue;
       try {
-        final ack = await _upsertAck('zaib_dealer_transfers', {
+        final payload = {
           'sync_id': syncId,
           'local_id': r['LedgerID'],
           'from_dealer_sync_id': fromSync,
@@ -1787,7 +1895,9 @@ class SyncService {
           'updated_at': updatedAt,
           'deleted_at': null,
           'device_id': deviceId,
-        });
+        };
+        final expectedRev = r['ServerRev'] == null ? null : _asInt(r['ServerRev']);
+        final ack = await _upsertAck('zaib_dealer_transfers', payload, expectedServerRev: (expectedRev == null || expectedRev == 0) ? null : expectedRev);
         await _finishUpload(
           db: db,
           cloudTable: 'zaib_dealer_transfers',
@@ -1796,11 +1906,7 @@ class SyncService {
           pk: r['LedgerID']!,
           syncId: syncId,
           uploadedUpdatedAt: updatedAt,
-          uploadedRow: {
-            'sync_id': syncId,
-            'updated_at': updatedAt,
-            'device_id': deviceId,
-          },
+          uploadedRow: payload,
           ack: ack,
         );
       } catch (e) {

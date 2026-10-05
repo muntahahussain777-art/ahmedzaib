@@ -18,7 +18,7 @@ class DealerBalanceApply {
         AppliedAt TEXT NOT NULL
       )
     ''');
-    await db.execute('''
+        await db.execute('''
       CREATE TABLE IF NOT EXISTS SyncDealerBalanceOp (
         SyncId TEXT PRIMARY KEY,
         DealerSyncId TEXT NOT NULL,
@@ -30,9 +30,13 @@ class DealerBalanceApply {
         Note TEXT,
         UpdatedAt TEXT NOT NULL,
         SyncDirty INTEGER NOT NULL DEFAULT 1,
-        DeletedAt TEXT
+        DeletedAt TEXT,
+        ServerRev INTEGER
       )
     ''');
+    try {
+      await db.execute('ALTER TABLE SyncDealerBalanceOp ADD COLUMN ServerRev INTEGER');
+    } catch (_) {}
   }
 
   /// Mark existing local children as already applied (no balance change).
