@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -8,6 +8,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/app_database.dart';
+import 'dealer_balance_apply.dart';
 import 'supabase_config.dart';
 import 'sync_meta.dart';
 import 'sync_policy.dart';
@@ -98,6 +99,8 @@ class SyncService {
         Outcome TEXT NOT NULL
       )
     ''');
+    await DealerBalanceApply.ensureTables(db);
+    await DealerBalanceApply.backfillMarkers(db);
   }
 
   Future<String> _ensureDeviceId() async {
@@ -155,6 +158,7 @@ class SyncService {
     try {
       await _pullAll();
       await _flushStaged();
+      SyncMeta.notifyDataApplied();
     } catch (e) {
       await _logFail('pull', null, e);
     }
@@ -187,6 +191,7 @@ class SyncService {
     await _pushStock(db, deviceId);
     await _pushBank(db, deviceId);
     await _pushExpenses(db, deviceId);
+    await _pushBalanceOps(db, deviceId);
   }
 
   /// Acknowledge only the exact uploaded local version (preserve mid-upload edits).
@@ -431,6 +436,9 @@ class SyncService {
       final dirty = rows.first['SyncDirty'];
       final dirtyInt = dirty is int ? dirty : int.tryParse('$dirty') ?? 0;
       if (dirtyInt == 1) return;
+    }
+    if (table == 'DieselLedgerCredit' || table == 'DieselLedgerDebit' || table == 'AddStock') {
+      await DealerBalanceApply.reverse(db: db, sourceSyncId: syncId, markDealerDirty: false);
     }
     await db.delete(table, where: 'SyncId = ?', whereArgs: [syncId]);
     await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
@@ -947,6 +955,44 @@ class SyncService {
     }
   }
 
+  Future<void> _pushBalanceOps(Database db, String deviceId) async {
+    final rows = await db.query('SyncDealerBalanceOp', where: 'IFNULL(SyncDirty,1) = 1 AND DeletedAt IS NULL');
+    for (final r in rows) {
+      final syncId = r['SyncId']?.toString() ?? '';
+      if (syncId.isEmpty) continue;
+      final updatedAt = (r['UpdatedAt']?.toString().isNotEmpty == true) ? r['UpdatedAt'].toString() : SyncMeta.nowIso();
+      try {
+        final ack = await _upsertAck('zaib_dealer_balance_ops', {
+          'sync_id': syncId,
+          'dealer_sync_id': r['DealerSyncId'],
+          'dd_delta': r['DdDelta'] ?? 0,
+          'd_delta': r['DDelta'] ?? 0,
+          'source_kind': r['SourceKind'] ?? 'manual',
+          'source_sync_id': r['SourceSyncId'],
+          'date_text': r['DateText'],
+          'note': r['Note'],
+          'updated_at': updatedAt,
+          'deleted_at': null,
+          'device_id': deviceId,
+        });
+        if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
+          final still = await db.query(
+            'SyncDealerBalanceOp',
+            columns: ['UpdatedAt'],
+            where: 'SyncId = ?',
+            whereArgs: [syncId],
+            limit: 1,
+          );
+          if (still.isNotEmpty && still.first['UpdatedAt']?.toString() == updatedAt) {
+            await db.update('SyncDealerBalanceOp', {'SyncDirty': 0}, where: 'SyncId = ?', whereArgs: [syncId]);
+          }
+        }
+      } catch (e) {
+        await _logFail('push:zaib_dealer_balance_ops', syncId, e);
+      }
+    }
+  }
+
   Future<void> _pushTombstones(String deviceId) async {
     final db = await AppDatabase.instance.database;
     final rows = await db.query('SyncTombstone');
@@ -998,6 +1044,7 @@ class SyncService {
     await safe(() => _pullTable('zaib_stock_diesel', _applyStock));
     await safe(() => _pullTable('zaib_bank_transactions', _applyBank));
     await safe(() => _pullTable('zaib_expenses', _applyExpense));
+    await safe(() => _pullTable('zaib_dealer_balance_ops', _applyBalanceOp));
   }
 
   Future<void> _pullTable(
@@ -1079,6 +1126,9 @@ class SyncService {
           case 'zaib_expenses':
             ok = await _applyExpense(db, row);
             break;
+          case 'zaib_dealer_balance_ops':
+            ok = await _applyBalanceOp(db, row);
+            break;
           default:
             await _logFail('flush:unknown:$cloud', s['SyncId']?.toString(), 'unknown staged table — kept');
             ok = false;
@@ -1128,25 +1178,6 @@ class SyncService {
     return int.tryParse('$v');
   }
 
-  Future<bool> _dealerHasPendingChildren(Database db, int? did) async {
-    if (did == null) return false;
-    Future<bool> dirty(String table, String col) async {
-      final rows = await db.query(
-        table,
-        columns: ['rowid'],
-        where: '$col = ? AND IFNULL(SyncDirty,1) = 1',
-        whereArgs: [did],
-        limit: 1,
-      );
-      return rows.isNotEmpty;
-    }
-
-    return await dirty('DieselLedgerCredit', 'Did') ||
-        await dirty('DieselLedgerDebit', 'Did') ||
-        await dirty('AddStock', 'DealerId') ||
-        await dirty('StockDiesel', 'SDid');
-  }
-
   Future<bool> _applyCustomer(Database db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
@@ -1184,26 +1215,23 @@ class SyncService {
       await _applyRemoteDelete(db, 'AddDealer', syncId);
       return true;
     }
-    final existing = await db.query('AddDealer', columns: ['Did', 'SyncDirty'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
+    final existing = await db.query('AddDealer', columns: ['Did'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
     if (existing.isNotEmpty) {
-      final did = existing.first['Did'];
-      final didInt = did is int ? did : int.tryParse('$did');
-      if (await _dealerHasPendingChildren(db, didInt)) {
-        // Preserve accounting formulas: do not overwrite aggregate balances while children pending.
-        await _upsertLocal(db, 'AddDealer', syncId, {
-          'DealerName': _asStr(r['dealer_name']),
-          'Date': _asStr(r['date_text']),
-          'SyncId': syncId,
-          'UpdatedAt': updated,
-          'SyncDirty': 0,
-        });
-        return true;
-      }
+      // Never overwrite DD/D from absolute remote values — children + balance_ops own aggregates.
+      await _upsertLocal(db, 'AddDealer', syncId, {
+        'DealerName': _asStr(r['dealer_name']),
+        'Date': _asStr(r['date_text']),
+        'SyncId': syncId,
+        'UpdatedAt': updated,
+        'SyncDirty': 0,
+      });
+      return true;
     }
     await _upsertLocal(db, 'AddDealer', syncId, {
       'DealerName': _asStr(r['dealer_name']),
-      'DDAmount': _asDouble(r['dd_amount']),
-      'DAmount': _asDouble(r['d_amount']),
+      // Opening/manual/children arrive via balance_ops + child reconcile — avoid absolute+child double count.
+      'DDAmount': 0,
+      'DAmount': 0,
       'Date': _asStr(r['date_text']),
       'SyncId': syncId,
       'UpdatedAt': updated,
@@ -1280,6 +1308,15 @@ class SyncService {
       'UpdatedAt': updated,
       'SyncDirty': 0,
     });
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: syncId,
+      dealerId: did,
+      dealerSyncId: dSync,
+      ddDelta: 0,
+      dDelta: _asDouble(r['amount_given']),
+      markDealerDirty: false,
+    );
     return true;
   }
 
@@ -1315,6 +1352,16 @@ class SyncService {
       'UpdatedAt': updated,
       'SyncDirty': 0,
     });
+    final dd = _asDouble(r['add_diesel']) * _asDouble(r['rate']);
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: syncId,
+      dealerId: did,
+      dealerSyncId: dSync,
+      ddDelta: dd,
+      dDelta: 0,
+      markDealerDirty: false,
+    );
     return true;
   }
 
@@ -1346,6 +1393,15 @@ class SyncService {
       'UpdatedAt': updated,
       'SyncDirty': 0,
     });
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: syncId,
+      dealerId: did,
+      dealerSyncId: dSync,
+      ddDelta: _asDouble(r['amount_given']),
+      dDelta: 0,
+      markDealerDirty: false,
+    );
     return true;
   }
 
@@ -1444,6 +1500,56 @@ class SyncService {
       'UpdatedAt': updated,
       'SyncDirty': 0,
     });
+    return true;
+  }
+
+  Future<bool> _applyBalanceOp(Database db, Map<String, dynamic> r) async {
+    final syncId = r['sync_id']?.toString() ?? '';
+    if (syncId.isEmpty) return true;
+    final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
+    final deleted = _isDeleted(r['deleted_at']);
+    final sourceKey = () {
+      final s = r['source_sync_id']?.toString();
+      if (s != null && s.isNotEmpty) return s;
+      return syncId;
+    }();
+    if (deleted) {
+      await DealerBalanceApply.reverse(db: db, sourceSyncId: sourceKey, markDealerDirty: false);
+      await db.delete('SyncDealerBalanceOp', where: 'SyncId = ?', whereArgs: [syncId]);
+      return true;
+    }
+    final dealerSync = r['dealer_sync_id']?.toString() ?? '';
+    final did = await _localIdBySync(db, 'AddDealer', 'Did', dealerSync);
+    if (dealerSync.isNotEmpty && did == null) {
+      await _stageRemote('zaib_dealer_balance_ops', r);
+      return false;
+    }
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: sourceKey,
+      dealerId: did,
+      dealerSyncId: dealerSync,
+      ddDelta: _asDouble(r['dd_delta']),
+      dDelta: _asDouble(r['d_delta']),
+      markDealerDirty: false,
+    );
+    await db.insert(
+      'SyncDealerBalanceOp',
+      {
+        'SyncId': syncId,
+        'DealerSyncId': dealerSync,
+        'DdDelta': _asDouble(r['dd_delta']),
+        'DDelta': _asDouble(r['d_delta']),
+        'SourceKind': _asStr(r['source_kind']).isEmpty ? 'manual' : _asStr(r['source_kind']),
+        'SourceSyncId': sourceKey,
+        'DateText': _asStr(r['date_text']),
+        'Note': _asStr(r['note']),
+        'UpdatedAt': updated,
+        'SyncDirty': 0,
+        'DeletedAt': null,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
     return true;
   }
 }

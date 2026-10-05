@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/report_totals.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -38,7 +39,7 @@ class StockListScreen extends StatefulWidget {
   State<StockListScreen> createState() => _StockListScreenState();
 }
 
-class _StockListScreenState extends State<StockListScreen> {
+class _StockListScreenState extends State<StockListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   final _from = TextEditingController();
   final _to = TextEditingController();
@@ -63,14 +64,18 @@ class _StockListScreenState extends State<StockListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final rows = await AppDatabase.instance.searchStockReport(
       query: _search.text,
       from: _from.text.trim().isEmpty ? null : _from.text.trim(),
       to: _to.text.trim().isEmpty ? null : _to.text.trim(),
     );
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _summary = StockSummaryTotals.fromRows(rows);
@@ -431,7 +436,7 @@ class BankListScreen extends StatefulWidget {
   State<BankListScreen> createState() => _BankListScreenState();
 }
 
-class _BankListScreenState extends State<BankListScreen> {
+class _BankListScreenState extends State<BankListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<BankTransaction> _items = [];
   bool _loading = true;
@@ -448,10 +453,14 @@ class _BankListScreenState extends State<BankListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final rows = await AppDatabase.instance.getBanks(query: _search.text);
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _loading = false;

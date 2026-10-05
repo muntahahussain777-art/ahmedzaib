@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../models/models.dart';
+import '../services/dealer_balance_apply.dart';
 import '../services/sync_meta.dart';
 import 'pc_schema.dart';
 
@@ -185,22 +186,23 @@ class AppDatabase {
     });
   }
 
-  Future<void> _adjustDAmount(int dealerId, double delta, DatabaseExecutor db) async {
-    if (dealerId <= 0 || delta == 0) return;
-    final n = await db.rawUpdate(
-      'UPDATE AddDealer SET DAmount = IFNULL(DAmount,0) + ?, UpdatedAt = ?, SyncDirty = 1 WHERE Did = ?',
-      [delta, SyncMeta.nowIso(), dealerId],
+  /// Child-driven aggregates stay local; do not SyncDirty dealer (avoids absolute LWW wipe).
+  Future<void> _reconcileChildBalance(
+    DatabaseExecutor db, {
+    required String sourceSyncId,
+    required int dealerId,
+    required double ddDelta,
+    required double dDelta,
+  }) async {
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: sourceSyncId,
+      dealerId: dealerId,
+      dealerSyncId: await DealerBalanceApply.dealerSyncId(db, dealerId),
+      ddDelta: ddDelta,
+      dDelta: dDelta,
+      markDealerDirty: false,
     );
-    if (n <= 0) throw Exception('Dealer DAmount update fail.');
-  }
-
-  Future<void> _adjustDdAmount(int dealerId, double delta, DatabaseExecutor db) async {
-    if (dealerId <= 0 || delta == 0) return;
-    final n = await db.rawUpdate(
-      'UPDATE AddDealer SET DDAmount = IFNULL(DDAmount,0) + ?, UpdatedAt = ?, SyncDirty = 1 WHERE Did = ?',
-      [delta, SyncMeta.nowIso(), dealerId],
-    );
-    if (n <= 0) throw Exception('Dealer DDAmount update fail.');
   }
 
   // ---------- Customers (AddCustomer) ----------
@@ -499,15 +501,54 @@ class AppDatabase {
 
   // ---------- Dealers (AddDealer) ----------
   Future<int> insertDealer(Dealer d) async {
-    final map = d.toMap()..remove('Did');
-    return _insertAndNotify('AddDealer', map);
+    return _runLocalWrite((txn) async {
+      final map = d.toMap()..remove('Did');
+      SyncMeta.stampNew(map);
+      final id = await txn.insert('AddDealer', map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      final dealerSync = map['SyncId']?.toString() ?? '';
+      if (dealerSync.isNotEmpty && (d.ddAmount != 0 || d.dAmount != 0)) {
+        await DealerBalanceApply.enqueueOp(
+          db: txn,
+          dealerSyncId: dealerSync,
+          ddDelta: d.ddAmount,
+          dDelta: d.dAmount,
+          sourceKind: 'opening',
+          sourceSyncId: 'opening:$dealerSync',
+          alreadyAppliedLocally: true,
+        );
+      }
+      return id;
+    });
   }
 
   Future<int> updateDealer(Dealer d) async {
-    final map = d.toMap()..remove('Did');
-    final existing = await _readSyncId('AddDealer', 'Did', d.id!);
-    if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
-    return _updateAndNotify('AddDealer', map, 'Did = ?', [d.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('AddDealer', 'Did', d.id!, txn);
+      if (auth == null) throw Exception('Update fail — record nahi mili.');
+      final oldDd = asDouble(auth['DDAmount']);
+      final oldD = asDouble(auth['DAmount']);
+      final ddDelta = d.ddAmount - oldDd;
+      final dDelta = d.dAmount - oldD;
+      final map = d.toMap()..remove('Did');
+      final existing = auth['SyncId']?.toString();
+      if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update('AddDealer', map, where: 'Did = ?', whereArgs: [d.id]);
+      if (n <= 0) throw Exception('Update fail — record nahi mili.');
+      final dealerSync = map['SyncId']?.toString() ?? '';
+      if (dealerSync.isNotEmpty && (ddDelta != 0 || dDelta != 0)) {
+        await DealerBalanceApply.enqueueOp(
+          db: txn,
+          dealerSyncId: dealerSync,
+          ddDelta: ddDelta,
+          dDelta: dDelta,
+          sourceKind: 'manual',
+          alreadyAppliedLocally: true,
+        );
+      }
+      return n;
+    });
   }
 
   Future<int> deleteDealer(int id) async {
@@ -568,7 +609,13 @@ class AppDatabase {
       SyncMeta.stampNew(map);
       final id = await txn.insert('DieselLedgerCredit', map);
       if (id <= 0) throw Exception('Save fail — 0 rows.');
-      await _adjustDAmount(p.dealerId, p.amountGiven, txn);
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: p.dealerId,
+        ddDelta: 0,
+        dDelta: p.amountGiven,
+      );
       return id;
     });
   }
@@ -577,16 +624,19 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('DieselLedgerCredit', 'LedgerID', p.id!, txn);
       if (auth == null) throw Exception('Update fail — record nahi mili.');
-      final authDealer = asInt(auth['Did']) ?? oldP.dealerId;
-      final authAmt = asDouble(auth['AmounGiven']);
-      await _adjustDAmount(authDealer, -authAmt, txn);
-      await _adjustDAmount(p.dealerId, p.amountGiven, txn);
       final map = p.toMap()..remove('LedgerID');
       final existing = auth['SyncId']?.toString();
       if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
       SyncMeta.stampUpdate(map);
       final n = await txn.update('DieselLedgerCredit', map, where: 'LedgerID = ?', whereArgs: [p.id]);
       if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: p.dealerId,
+        ddDelta: 0,
+        dDelta: p.amountGiven,
+      );
       return n;
     });
   }
@@ -595,10 +645,11 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('DieselLedgerCredit', 'LedgerID', p.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
-      final authDealer = asInt(auth['Did']) ?? p.dealerId;
-      final authAmt = asDouble(auth['AmounGiven']);
-      await _adjustDAmount(authDealer, -authAmt, txn);
-      await _tombstone('zaib_dealer_payouts', auth['SyncId']?.toString(), txn);
+      final syncId = auth['SyncId']?.toString() ?? '';
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_payouts', syncId.isEmpty ? null : syncId, txn);
       final n = await txn.delete('DieselLedgerCredit', where: 'LedgerID = ?', whereArgs: [p.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -625,7 +676,13 @@ class AppDatabase {
       SyncMeta.stampNew(map);
       final id = await txn.insert('AddStock', map);
       if (id <= 0) throw Exception('Save fail — 0 rows.');
-      await _adjustDdAmount(e.dealerId, e.amount, txn);
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amount,
+        dDelta: 0,
+      );
       return id;
     });
   }
@@ -634,16 +691,19 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('AddStock', 'Sid', e.id!, txn);
       if (auth == null) throw Exception('Update fail — record nahi mili.');
-      final authDealer = asInt(auth['DealerId']) ?? oldE.dealerId;
-      final authAmt = (asDouble(auth['AddDisel'])) * (asDouble(auth['Rate']));
-      await _adjustDdAmount(authDealer, -authAmt, txn);
-      await _adjustDdAmount(e.dealerId, e.amount, txn);
       final map = e.toMap()..remove('Sid');
       final existing = auth['SyncId']?.toString();
       if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
       SyncMeta.stampUpdate(map);
       final n = await txn.update('AddStock', map, where: 'Sid = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amount,
+        dDelta: 0,
+      );
       return n;
     });
   }
@@ -652,10 +712,11 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('AddStock', 'Sid', e.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
-      final authDealer = asInt(auth['DealerId']) ?? e.dealerId;
-      final authAmt = (asDouble(auth['AddDisel'])) * (asDouble(auth['Rate']));
-      await _adjustDdAmount(authDealer, -authAmt, txn);
-      await _tombstone('zaib_dealer_purchases', auth['SyncId']?.toString(), txn);
+      final syncId = auth['SyncId']?.toString() ?? '';
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_purchases', syncId.isEmpty ? null : syncId, txn);
       final n = await txn.delete('AddStock', where: 'Sid = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;
@@ -696,7 +757,13 @@ class AppDatabase {
       SyncMeta.stampNew(map);
       final id = await txn.insert('DieselLedgerDebit', map);
       if (id <= 0) throw Exception('Save fail — 0 rows.');
-      await _adjustDdAmount(e.dealerId, e.amountGiven, txn);
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amountGiven,
+        dDelta: 0,
+      );
       return id;
     });
   }
@@ -705,16 +772,19 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('DieselLedgerDebit', 'LedgerID', e.id!, txn);
       if (auth == null) throw Exception('Update fail — record nahi mili.');
-      final authDealer = asInt(auth['Did']) ?? oldE.dealerId;
-      final authAmt = asDouble(auth['AmounGiven']);
-      await _adjustDdAmount(authDealer, -authAmt, txn);
-      await _adjustDdAmount(e.dealerId, e.amountGiven, txn);
       final map = e.toMap()..remove('LedgerID');
       final existing = auth['SyncId']?.toString();
       if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
       SyncMeta.stampUpdate(map);
       final n = await txn.update('DieselLedgerDebit', map, where: 'LedgerID = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amountGiven,
+        dDelta: 0,
+      );
       return n;
     });
   }
@@ -723,10 +793,11 @@ class AppDatabase {
     return _runLocalWrite((txn) async {
       final auth = await _readRow('DieselLedgerDebit', 'LedgerID', e.id!, txn);
       if (auth == null) throw Exception('Delete fail — record nahi mili.');
-      final authDealer = asInt(auth['Did']) ?? e.dealerId;
-      final authAmt = asDouble(auth['AmounGiven']);
-      await _adjustDdAmount(authDealer, -authAmt, txn);
-      await _tombstone('zaib_dealer_direct', auth['SyncId']?.toString(), txn);
+      final syncId = auth['SyncId']?.toString() ?? '';
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_direct', syncId.isEmpty ? null : syncId, txn);
       final n = await txn.delete('DieselLedgerDebit', where: 'LedgerID = ?', whereArgs: [e.id]);
       if (n <= 0) throw Exception('Delete fail — 0 rows.');
       return n;

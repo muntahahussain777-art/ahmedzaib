@@ -189,6 +189,31 @@ class PcSchema {
         Outcome TEXT NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncBalanceApplied (
+        SourceSyncId TEXT PRIMARY KEY,
+        DealerId INTEGER,
+        DealerSyncId TEXT,
+        DdDelta REAL NOT NULL DEFAULT 0,
+        DDelta REAL NOT NULL DEFAULT 0,
+        AppliedAt TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncDealerBalanceOp (
+        SyncId TEXT PRIMARY KEY,
+        DealerSyncId TEXT NOT NULL,
+        DdDelta REAL NOT NULL DEFAULT 0,
+        DDelta REAL NOT NULL DEFAULT 0,
+        SourceKind TEXT NOT NULL DEFAULT 'manual',
+        SourceSyncId TEXT,
+        DateText TEXT,
+        Note TEXT,
+        UpdatedAt TEXT NOT NULL,
+        SyncDirty INTEGER NOT NULL DEFAULT 1,
+        DeletedAt TEXT
+      )
+    ''');
 
     // Local-only Bul Mal (sync/pull nahi — PC cloud se alag)
     await db.execute('''

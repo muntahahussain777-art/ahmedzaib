@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/report_totals.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -38,7 +39,7 @@ class CreditCustomerListScreen extends StatefulWidget {
   State<CreditCustomerListScreen> createState() => _CreditCustomerListScreenState();
 }
 
-class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
+class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<CreditCustomerEntry> _items = [];
   List<String> _nameSuggestions = [];
@@ -59,7 +60,11 @@ class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner || _initial) {
       if (mounted) setState(() => _loading = true);
     }
@@ -68,7 +73,7 @@ class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
     final byName = matched?.id == null ? null : await AppDatabase.instance.getCustomerLedgerSummary(matched!.id!);
     final totals = byName ?? await AppDatabase.instance.getGlobalCustomerLedger();
     final customers = await AppDatabase.instance.getCustomers();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _totals = totals;
@@ -330,7 +335,7 @@ class DealerPayoutListScreen extends StatefulWidget {
   State<DealerPayoutListScreen> createState() => _DealerPayoutListScreenState();
 }
 
-class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
+class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<DealerPayout> _items = [];
   List<String> _nameSuggestions = [];
@@ -349,13 +354,17 @@ class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner || _initial) {
       if (mounted) setState(() => _loading = true);
     }
     final rows = await AppDatabase.instance.getPayouts(query: _search.text);
     final dealers = await AppDatabase.instance.getDealers();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _nameSuggestions = dealers.map((d) => d.name).where((n) => n.trim().isNotEmpty).toList();
@@ -575,7 +584,7 @@ class DealerAmountListScreen extends StatefulWidget {
   State<DealerAmountListScreen> createState() => _DealerAmountListScreenState();
 }
 
-class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
+class _DealerAmountListScreenState extends State<DealerAmountListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   final _from = TextEditingController();
   final _to = TextEditingController();
@@ -601,7 +610,11 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner || _initial) {
       if (mounted) setState(() => _loading = true);
     }
@@ -618,7 +631,7 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
         : await AppDatabase.instance.getDealerLedgerSummary(dealerMatched!.id!);
     final avg = LitterRateAvgSummary.fromDealerAmount(rows);
     final dealers = await AppDatabase.instance.getDealers();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _dealerTotals = dealerTotals;
@@ -910,7 +923,7 @@ class DirectDealerListScreen extends StatefulWidget {
   State<DirectDealerListScreen> createState() => _DirectDealerListScreenState();
 }
 
-class _DirectDealerListScreenState extends State<DirectDealerListScreen> {
+class _DirectDealerListScreenState extends State<DirectDealerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<DirectDealerAmount> _items = [];
   bool _loading = true;
@@ -927,10 +940,14 @@ class _DirectDealerListScreenState extends State<DirectDealerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final rows = await AppDatabase.instance.getDirects(query: _search.text);
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _loading = false;

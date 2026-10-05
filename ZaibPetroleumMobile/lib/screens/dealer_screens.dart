@@ -6,6 +6,7 @@ import '../data/app_database.dart';
 import '../models/models.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -18,7 +19,7 @@ class DealerListScreen extends StatefulWidget {
   State<DealerListScreen> createState() => _DealerListScreenState();
 }
 
-class _DealerListScreenState extends State<DealerListScreen> {
+class _DealerListScreenState extends State<DealerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<Dealer> _items = [];
   List<String> _nameSuggestions = [];
@@ -39,7 +40,11 @@ class _DealerListScreenState extends State<DealerListScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner || _initial) {
       if (mounted) setState(() => _loading = true);
     }
@@ -48,7 +53,7 @@ class _DealerListScreenState extends State<DealerListScreen> {
     final matched = await AppDatabase.instance.findDealerByExactName(_search.text);
     final byName = matched?.id == null ? null : await AppDatabase.instance.getDealerLedgerSummary(matched!.id!);
     final totals = byName ?? await AppDatabase.instance.getGlobalDealerLedger();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _totals = totals;

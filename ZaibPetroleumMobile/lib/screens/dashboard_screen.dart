@@ -4,6 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../data/app_database.dart';
 import '../models/models.dart';
 import '../theme/app_theme.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -14,7 +15,7 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen> with SyncAwareReload {
   DashboardStats? _stats;
   bool _loading = true;
   int? _year;
@@ -29,10 +30,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _load();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final stats = await AppDatabase.instance.getDashboardStats(year: _year, month: _month);
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _stats = stats;
       _loading = false;

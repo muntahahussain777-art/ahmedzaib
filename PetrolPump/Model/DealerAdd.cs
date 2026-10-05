@@ -9,6 +9,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ZaibPetroleumService.Services;
 
 namespace ZaibPetroleumService.Model
 {
@@ -105,6 +106,24 @@ namespace ZaibPetroleumService.Model
                 return;
             }
 
+            decimal newDd = string.IsNullOrWhiteSpace(txtmobile.Text) ? 0 : Convert.ToDecimal(txtmobile.Text.Replace(",", ""));
+            decimal newD = DAmount;
+            decimal oldDd = 0;
+            decimal oldD = 0;
+            string dealerSyncId = null;
+            if (id > 0)
+            {
+                string readQry = "SELECT DDAmount, DAmount, SyncId FROM AddDealer WHERE Did = @id";
+                Hashtable readHt = new Hashtable { { "@id", id } };
+                DataTable oldDt = MainClass.ExecuteSelectQuery(readQry, readHt);
+                if (oldDt.Rows.Count > 0)
+                {
+                    oldDd = oldDt.Rows[0]["DDAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(oldDt.Rows[0]["DDAmount"]);
+                    oldD = oldDt.Rows[0]["DAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(oldDt.Rows[0]["DAmount"]);
+                    dealerSyncId = oldDt.Rows[0]["SyncId"]?.ToString();
+                }
+            }
+
             // Prepare query for database
             string qry = "";
             if (id == 0)
@@ -120,15 +139,45 @@ namespace ZaibPetroleumService.Model
     {
         { "@id", id },
         { "@name", txtname.Text },
-        // Set DDAmount to 0 if txtmobile is empty
-        { "@Amount", string.IsNullOrWhiteSpace(txtmobile.Text) ? 0 : Convert.ToDecimal(txtmobile.Text) },
-        { "@DAmount", DAmount },  // DAmount from the variable
-        { "@date", dateValue.ToString("yyyy-MM-dd") } // Convert date to proper format
+        { "@Amount", newDd },
+        { "@DAmount", newD },
+        { "@date", dateValue.ToString("yyyy-MM-dd") }
     };
 
+            int savedId = id;
             int r = MainClass.DataInsertUpdateDelete(qry, ht);
             if (r > 0)
             {
+                if (savedId > 0 && !string.IsNullOrWhiteSpace(dealerSyncId))
+                {
+                    double ddDelta = (double)(newDd - oldDd);
+                    double dDelta = (double)(newD - oldD);
+                    if (Math.Abs(ddDelta) > 1e-9 || Math.Abs(dDelta) > 1e-9)
+                    {
+                        SupabaseSyncService.EnqueueManualDealerBalanceOp(
+                            savedId, dealerSyncId, ddDelta, dDelta, dateValue.ToString("yyyy-MM-dd"));
+                    }
+                }
+                else if (savedId == 0 && (Math.Abs((double)newDd) > 1e-9 || Math.Abs((double)newD) > 1e-9))
+                {
+                    string lookupQry = "SELECT Did, SyncId FROM AddDealer WHERE DealerName = @name AND Date = @date ORDER BY Did DESC LIMIT 1";
+                    Hashtable lookupHt = new Hashtable
+                    {
+                        { "@name", txtname.Text },
+                        { "@date", dateValue.ToString("yyyy-MM-dd") }
+                    };
+                    DataTable newDt = MainClass.ExecuteSelectQuery(lookupQry, lookupHt);
+                    if (newDt.Rows.Count > 0)
+                    {
+                        int newDid = Convert.ToInt32(newDt.Rows[0]["Did"]);
+                        string newSync = newDt.Rows[0]["SyncId"]?.ToString();
+                        if (!string.IsNullOrWhiteSpace(newSync))
+                        {
+                            SupabaseSyncService.EnqueueOpeningDealerBalanceOp(
+                                newDid, newSync, (double)newDd, (double)newD, dateValue.ToString("yyyy-MM-dd"));
+                        }
+                    }
+                }
                 CustomeMessage customMessageBox = new CustomeMessage("Saved Successfully", "Save");
                 customMessageBox.ShowDialog();
                 MainClass.Enable_reset_keep_date(this, txtdate);

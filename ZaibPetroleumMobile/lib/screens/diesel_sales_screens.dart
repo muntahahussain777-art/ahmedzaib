@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/report_totals.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -17,7 +18,7 @@ class DieselSalesListScreen extends StatefulWidget {
   State<DieselSalesListScreen> createState() => _DieselSalesListScreenState();
 }
 
-class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
+class _DieselSalesListScreenState extends State<DieselSalesListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   final _from = TextEditingController();
   final _to = TextEditingController();
@@ -43,7 +44,11 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner || _initial) {
       if (mounted) setState(() => _loading = true);
     }
@@ -59,7 +64,7 @@ class _DieselSalesListScreenState extends State<DieselSalesListScreen> {
     final totals = byName ?? await AppDatabase.instance.getGlobalCustomerLedger();
     final avg = LitterRateAvgSummary.fromDiesel(rows);
     final customers = await AppDatabase.instance.getCustomers();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _totals = totals;

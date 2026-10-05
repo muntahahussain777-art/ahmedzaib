@@ -106,7 +106,7 @@ namespace ZaibPetroleumService.Services
             {
                 "zaib_customers","zaib_dealers","zaib_petrol_entries","zaib_dealer_payouts",
                 "zaib_dealer_purchases","zaib_dealer_direct","zaib_stock_diesel",
-                "zaib_bank_transactions","zaib_expenses"
+                "zaib_bank_transactions","zaib_expenses","zaib_dealer_balance_ops"
             };
         }
 
@@ -209,6 +209,27 @@ namespace ZaibPetroleumService.Services
                     ServerPayloadJson TEXT,
                     Outcome TEXT NOT NULL
                 );");
+                Exec(con, @"CREATE TABLE IF NOT EXISTS SyncBalanceApplied (
+                    SourceSyncId TEXT PRIMARY KEY,
+                    DealerId INTEGER,
+                    DealerSyncId TEXT,
+                    DdDelta REAL NOT NULL DEFAULT 0,
+                    DDelta REAL NOT NULL DEFAULT 0,
+                    AppliedAt TEXT NOT NULL
+                );");
+                Exec(con, @"CREATE TABLE IF NOT EXISTS SyncDealerBalanceOp (
+                    SyncId TEXT PRIMARY KEY,
+                    DealerSyncId TEXT NOT NULL,
+                    DdDelta REAL NOT NULL DEFAULT 0,
+                    DDelta REAL NOT NULL DEFAULT 0,
+                    SourceKind TEXT NOT NULL DEFAULT 'manual',
+                    SourceSyncId TEXT,
+                    DateText TEXT,
+                    Note TEXT,
+                    UpdatedAt TEXT NOT NULL,
+                    SyncDirty INTEGER NOT NULL DEFAULT 1,
+                    DeletedAt TEXT
+                );");
 
                 BackfillSyncIds(con, "AddCustomer", "id");
                 BackfillSyncIds(con, "PetrolAdd", "pid");
@@ -226,7 +247,8 @@ namespace ZaibPetroleumService.Services
                 EnsureTrigger(con, "trg_sync_PetrolAdd_ai", "PetrolAdd", "INSERT", "Date,ReceiptNo,vehicle,Litter,Rate,Advance,Amount,Credit,Balance,Note,CustomerId,Processed,IsInitialEntry");
                 EnsureTrigger(con, "trg_sync_PetrolAdd_au", "PetrolAdd", "UPDATE", "Date,ReceiptNo,vehicle,Litter,Rate,Advance,Amount,Credit,Balance,Note,CustomerId,Processed,IsInitialEntry");
                 EnsureTrigger(con, "trg_sync_AddDealer_ai", "AddDealer", "INSERT", "DealerName,DDAmount,DAmount,Date");
-                EnsureTrigger(con, "trg_sync_AddDealer_au", "AddDealer", "UPDATE", "DealerName,DDAmount,DAmount,Date");
+                EnsureTrigger(con, "trg_sync_AddDealer_au", "AddDealer", "UPDATE", "DealerName,Date");
+                BackfillBalanceMarkers(con);
                 EnsureTrigger(con, "trg_sync_DieselLedgerCredit_ai", "DieselLedgerCredit", "INSERT", "Did,Date,AmounGiven,Note");
                 EnsureTrigger(con, "trg_sync_DieselLedgerCredit_au", "DieselLedgerCredit", "UPDATE", "Did,Date,AmounGiven,Note");
                 EnsureTrigger(con, "trg_sync_AddStock_ai", "AddStock", "INSERT", "Vehicle,Rate,SellDisel,Stock,Date,AddDisel,DealerId,Note");
@@ -399,6 +421,7 @@ END;";
                     await PushTombstones(con);
                     await PushCustomers(con);
                     await PushDealers(con);
+                    await PushDealerBalanceOps(con);
                     await PushPetrol(con);
                     await PushPayouts(con);
                     await PushPurchases(con);
@@ -418,11 +441,13 @@ END;";
                     var remoteStock = await SelectSincePagedAsync("zaib_stock_diesel");
                     var remoteBank = await SelectSincePagedAsync("zaib_bank_transactions");
                     var remoteExpenses = await SelectSincePagedAsync("zaib_expenses");
+                    var remoteDealerBalanceOps = await SelectSincePagedAsync("zaib_dealer_balance_ops");
 
                     // Apply under one short write txn + guard. No awaits while guard is active.
                     // Checkpoints only advance after successful commit (avoid skip-after-rollback).
                     string custCp = null, dealerCp = null, petrolCp = null, payoutCp = null,
-                        purchaseCp = null, directCp = null, stockCp = null, bankCp = null, expenseCp = null;
+                        purchaseCp = null, directCp = null, stockCp = null, bankCp = null, expenseCp = null,
+                        dealerBalanceOpCp = null;
                     using (var tx = con.BeginTransaction())
                     {
                         try
@@ -437,6 +462,7 @@ END;";
                             stockCp = ApplyStock(con, remoteStock);
                             bankCp = ApplyBank(con, remoteBank);
                             expenseCp = ApplyExpenses(con, remoteExpenses);
+                            dealerBalanceOpCp = ApplyDealerBalanceOps(con, remoteDealerBalanceOps);
                             FlushStaged(con);
                             EndRemoteApply(con);
                             tx.Commit();
@@ -457,6 +483,7 @@ END;";
                     SetCheckpoint("zaib_stock_diesel", stockCp);
                     SetCheckpoint("zaib_bank_transactions", bankCp);
                     SetCheckpoint("zaib_expenses", expenseCp);
+                    SetCheckpoint("zaib_dealer_balance_ops", dealerBalanceOpCp);
                 }
             }
             catch (Exception ex)
@@ -476,6 +503,62 @@ END;";
                 Interlocked.Exchange(ref _running, 0);
                 if (Interlocked.Exchange(ref _queued, 0) == 1)
                     await SyncNowSafe();
+            }
+        }
+
+        /// <summary>Manual dealer DD/D edit: queue cloud op + idempotency marker (balance already updated locally).</summary>
+        public static void EnqueueManualDealerBalanceOp(int dealerId, string dealerSyncId, double ddDelta, double dDelta, string dateText = null)
+        {
+            EnqueueDealerBalanceOp(dealerId, dealerSyncId, ddDelta, dDelta, dateText, "manual", null);
+        }
+
+        /// <summary>New dealer opening DD/D: stable SourceSyncId opening:{dealerSyncId}, source_kind opening.</summary>
+        public static void EnqueueOpeningDealerBalanceOp(int dealerId, string dealerSyncId, double ddDelta, double dDelta, string dateText = null)
+        {
+            if (string.IsNullOrWhiteSpace(dealerSyncId)) return;
+            EnqueueDealerBalanceOp(dealerId, dealerSyncId, ddDelta, dDelta, dateText, "opening", "opening:" + dealerSyncId);
+        }
+
+        private static void EnqueueDealerBalanceOp(
+            int dealerId, string dealerSyncId, double ddDelta, double dDelta, string dateText,
+            string sourceKind, string fixedSourceSyncId)
+        {
+            if (string.IsNullOrWhiteSpace(dealerSyncId) || (Math.Abs(ddDelta) < 1e-9 && Math.Abs(dDelta) < 1e-9))
+                return;
+            EnsureLocalSyncReady();
+            using (var con = new SQLiteConnection(projectconnection.ConnectionString))
+            {
+                con.Open();
+                string syncId = Guid.NewGuid().ToString();
+                string sourceSyncId = string.IsNullOrWhiteSpace(fixedSourceSyncId) ? syncId : fixedSourceSyncId;
+                string kind = string.IsNullOrWhiteSpace(sourceKind) ? "manual" : sourceKind;
+                string now = DateTime.UtcNow.ToString("o");
+                using (var cmd = new SQLiteCommand(
+                    @"INSERT INTO SyncDealerBalanceOp(SyncId,DealerSyncId,DdDelta,DDelta,SourceKind,SourceSyncId,DateText,UpdatedAt,SyncDirty,DeletedAt)
+                      VALUES(@sid,@ds,@dd,@d,@sk,@src,@dt,@u,1,NULL)", con))
+                {
+                    cmd.Parameters.AddWithValue("@sid", syncId);
+                    cmd.Parameters.AddWithValue("@ds", dealerSyncId);
+                    cmd.Parameters.AddWithValue("@dd", ddDelta);
+                    cmd.Parameters.AddWithValue("@d", dDelta);
+                    cmd.Parameters.AddWithValue("@sk", kind);
+                    cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                    cmd.Parameters.AddWithValue("@dt", (object)dateText ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@u", now);
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = new SQLiteCommand(
+                    @"INSERT OR REPLACE INTO SyncBalanceApplied(SourceSyncId,DealerId,DealerSyncId,DdDelta,DDelta,AppliedAt)
+                      VALUES(@src,@did,@ds,@dd,@d,@a)", con))
+                {
+                    cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                    cmd.Parameters.AddWithValue("@did", dealerId);
+                    cmd.Parameters.AddWithValue("@ds", dealerSyncId);
+                    cmd.Parameters.AddWithValue("@dd", ddDelta);
+                    cmd.Parameters.AddWithValue("@d", dDelta);
+                    cmd.Parameters.AddWithValue("@a", now);
+                    cmd.ExecuteNonQuery();
+                }
             }
         }
 
@@ -778,6 +861,41 @@ END;";
             }
         }
 
+        private static async Task PushDealerBalanceOps(SQLiteConnection con)
+        {
+            if (!TableExists(con, "SyncDealerBalanceOp")) return;
+            var dt = QueryDirty(con, "SELECT * FROM SyncDealerBalanceOp WHERE IFNULL(SyncDirty,1)=1");
+            foreach (DataRow r in dt.Rows)
+            {
+                string syncId = Convert.ToString(r["SyncId"]);
+                if (string.IsNullOrWhiteSpace(syncId)) continue;
+                string dealerSync = Convert.ToString(r["DealerSyncId"]) ?? "";
+                if (string.IsNullOrWhiteSpace(dealerSync)) continue;
+                string updatedAt = RowUpdatedAt(r);
+                string deletedAt = r["DeletedAt"] == DBNull.Value ? null : Convert.ToString(r["DeletedAt"]);
+                try
+                {
+                    var ack = await UpsertAsync("zaib_dealer_balance_ops", new
+                    {
+                        sync_id = syncId,
+                        dealer_sync_id = dealerSync,
+                        dd_delta = ToD(r["DdDelta"]),
+                        d_delta = ToD(r["DDelta"]),
+                        source_kind = Convert.ToString(r["SourceKind"]) ?? "manual",
+                        source_sync_id = Convert.ToString(r["SourceSyncId"]) ?? syncId,
+                        date_text = Convert.ToString(r["DateText"]) ?? "",
+                        note = Convert.ToString(r["Note"]) ?? "",
+                        updated_at = updatedAt,
+                        deleted_at = deletedAt,
+                        device_id = _deviceId
+                    });
+                    await FinishUpload(con, "zaib_dealer_balance_ops", "SyncDealerBalanceOp", "SyncId", syncId, syncId, updatedAt,
+                        JsonConvert.SerializeObject(new { sync_id = syncId, updated_at = updatedAt, device_id = _deviceId }), ack);
+                }
+                catch (Exception ex) { LogFail(con, "push:zaib_dealer_balance_ops", syncId, ex); }
+            }
+        }
+
         private static async Task PushPetrol(SQLiteConnection con)
         {
             var dt = QueryDirty(con, "SELECT * FROM PetrolAdd WHERE IFNULL(SyncDirty,1)=1");
@@ -836,6 +954,7 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
+                EnsureChildBalanceMarker(con, syncId, r["Did"], 0, ToD(r["AmounGiven"]));
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_payouts", new
@@ -866,6 +985,7 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
+                EnsureChildBalanceMarker(con, syncId, r["DealerId"], ToD(r["AddDisel"]) * ToD(r["Rate"]), 0);
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_purchases", new
@@ -898,6 +1018,7 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
+                EnsureChildBalanceMarker(con, syncId, r["Did"], ToD(r["AmounGiven"]), 0);
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_direct", new
@@ -1266,38 +1387,22 @@ END;";
                 {
                     chk.Parameters.AddWithValue("@s", syncId);
                     var exists = chk.ExecuteScalar();
-                    bool skipBalances = exists != null && DealerHasPendingChildren(con, exists);
                     if (exists == null)
                     {
-                        using (var i = new SQLiteCommand("INSERT INTO AddDealer(DealerName,DDAmount,DAmount,Date,SyncId,UpdatedAt,SyncDirty) VALUES(@n,@dd,@d,@dt,@s,@u,0)", con))
+                        using (var i = new SQLiteCommand("INSERT INTO AddDealer(DealerName,DDAmount,DAmount,Date,SyncId,UpdatedAt,SyncDirty) VALUES(@n,0,0,@dt,@s,@u,0)", con))
                         {
                             i.Parameters.AddWithValue("@n", r.Value<string>("dealer_name") ?? "");
-                            i.Parameters.AddWithValue("@dd", r.Value<double?>("dd_amount") ?? 0);
-                            i.Parameters.AddWithValue("@d", r.Value<double?>("d_amount") ?? 0);
                             i.Parameters.AddWithValue("@dt", r.Value<string>("date_text") ?? "");
                             i.Parameters.AddWithValue("@s", syncId);
                             i.Parameters.AddWithValue("@u", updated);
                             i.ExecuteNonQuery();
                         }
                     }
-                    else if (skipBalances)
+                    else
                     {
                         using (var u = new SQLiteCommand("UPDATE AddDealer SET DealerName=@n, Date=@dt, UpdatedAt=@u, SyncDirty=0 WHERE SyncId=@s", con))
                         {
                             u.Parameters.AddWithValue("@n", r.Value<string>("dealer_name") ?? "");
-                            u.Parameters.AddWithValue("@dt", r.Value<string>("date_text") ?? "");
-                            u.Parameters.AddWithValue("@u", updated);
-                            u.Parameters.AddWithValue("@s", syncId);
-                            u.ExecuteNonQuery();
-                        }
-                    }
-                    else
-                    {
-                        using (var u = new SQLiteCommand("UPDATE AddDealer SET DealerName=@n, DDAmount=@dd, DAmount=@d, Date=@dt, UpdatedAt=@u, SyncDirty=0 WHERE SyncId=@s", con))
-                        {
-                            u.Parameters.AddWithValue("@n", r.Value<string>("dealer_name") ?? "");
-                            u.Parameters.AddWithValue("@dd", r.Value<double?>("dd_amount") ?? 0);
-                            u.Parameters.AddWithValue("@d", r.Value<double?>("d_amount") ?? 0);
                             u.Parameters.AddWithValue("@dt", r.Value<string>("date_text") ?? "");
                             u.Parameters.AddWithValue("@u", updated);
                             u.Parameters.AddWithValue("@s", syncId);
@@ -1410,6 +1515,7 @@ END;";
                 }
                 if (deleted)
                 {
+                    ReverseDealerBalance(con, syncId);
                     ApplyRemoteDelete(con, "AddStock", syncId);
                     AdvanceCheckpoint(updated, syncId, ref appliedMax);
                     continue;
@@ -1441,6 +1547,9 @@ END;";
                         cmd.ExecuteNonQuery();
                     }
                 }
+                double addDiesel = r.Value<double?>("add_diesel") ?? 0;
+                double rate = r.Value<double?>("rate") ?? 0;
+                ReconcileDealerBalance(con, syncId, did, addDiesel * rate, 0);
                 AdvanceCheckpoint(updated, syncId, ref appliedMax);
             }
             return appliedMax;
@@ -1724,7 +1833,7 @@ END;";
                         {
                             applied = false;
                         }
-                        else if (deleted) { ApplyRemoteDelete(con, "AddStock", syncId); applied = true; }
+                        else if (deleted) { ReverseDealerBalance(con, syncId); ApplyRemoteDelete(con, "AddStock", syncId); applied = true; }
                         else
                         {
                             string dSync = payload.Value<string>("dealer_sync_id");
@@ -1753,9 +1862,19 @@ END;";
                                         cmd.ExecuteNonQuery();
                                     }
                                 }
+                                double addDiesel = payload.Value<double?>("add_diesel") ?? 0;
+                                double rate = payload.Value<double?>("rate") ?? 0;
+                                ReconcileDealerBalance(con, syncId, did, addDiesel * rate, 0);
                                 applied = true;
                             }
                         }
+                    }
+                    else if (cloud == "zaib_dealer_balance_ops")
+                    {
+                        string updated = payload.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
+                        bool deleted = payload["deleted_at"] != null && payload["deleted_at"].Type != JTokenType.Null;
+                        if (ApplyDealerBalanceOpRow(con, payload, updated, deleted, out _))
+                            applied = true;
                     }
                     else if (cloud == "zaib_stock_diesel")
                     {
@@ -1866,6 +1985,252 @@ END;";
             }
         }
 
+        private static string ApplyDealerBalanceOps(SQLiteConnection con, IEnumerable<JObject> rows)
+        {
+            string appliedMax = GetCheckpoint("zaib_dealer_balance_ops");
+            foreach (var r in rows)
+            {
+                string syncId = r.Value<string>("sync_id");
+                if (string.IsNullOrWhiteSpace(syncId)) continue;
+                string updated = r.Value<string>("updated_at") ?? DateTime.UtcNow.ToString("o");
+                bool deleted = r["deleted_at"] != null && r["deleted_at"].Type != JTokenType.Null;
+                ApplyDealerBalanceOpRow(con, r, updated, deleted, out bool advanceCp);
+                if (advanceCp)
+                    AdvanceCheckpoint(updated, syncId, ref appliedMax);
+            }
+            return appliedMax;
+        }
+
+        private static bool ApplyDealerBalanceOpRow(SQLiteConnection con, JObject r, string updated, bool deleted, out bool advanceCheckpoint)
+        {
+            advanceCheckpoint = true;
+            string syncId = r.Value<string>("sync_id");
+            if (string.IsNullOrWhiteSpace(syncId)) return true;
+            if (!ShouldApply(con, "SyncDealerBalanceOp", syncId, updated, deleted, r.Value<string>("device_id")))
+            {
+                if (HasTombstone(con, syncId) || IsSyncDirty(con, "SyncDealerBalanceOp", syncId))
+                    StageRemote(con, "zaib_dealer_balance_ops", r);
+                return false;
+            }
+            string sourceSyncId = r.Value<string>("source_sync_id");
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) sourceSyncId = syncId;
+            if (deleted)
+            {
+                ReverseDealerBalance(con, sourceSyncId);
+                using (var u = new SQLiteCommand(
+                    "UPDATE SyncDealerBalanceOp SET DeletedAt=@d, UpdatedAt=@u, SyncDirty=0 WHERE SyncId=@s", con))
+                {
+                    u.Parameters.AddWithValue("@d", r.Value<string>("deleted_at") ?? updated);
+                    u.Parameters.AddWithValue("@u", updated);
+                    u.Parameters.AddWithValue("@s", syncId);
+                    u.ExecuteNonQuery();
+                }
+                return true;
+            }
+            string dealerSync = r.Value<string>("dealer_sync_id") ?? "";
+            object did = LocalIdBySync(con, "AddDealer", "Did", dealerSync);
+            if (!string.IsNullOrWhiteSpace(dealerSync) && (did == null || did == DBNull.Value))
+            {
+                StageRemote(con, "zaib_dealer_balance_ops", r);
+                advanceCheckpoint = false;
+                return false;
+            }
+            using (var chk = new SQLiteCommand("SELECT SyncId FROM SyncDealerBalanceOp WHERE SyncId=@s", con))
+            {
+                chk.Parameters.AddWithValue("@s", syncId);
+                var exists = chk.ExecuteScalar();
+                string sql = exists == null
+                    ? @"INSERT INTO SyncDealerBalanceOp(SyncId,DealerSyncId,DdDelta,DDelta,SourceKind,SourceSyncId,DateText,Note,UpdatedAt,SyncDirty,DeletedAt)
+                        VALUES(@sid,@ds,@dd,@d,@sk,@src,@dt,@note,@u,0,NULL)"
+                    : @"UPDATE SyncDealerBalanceOp SET DealerSyncId=@ds, DdDelta=@dd, DDelta=@d, SourceKind=@sk, SourceSyncId=@src,
+                        DateText=@dt, Note=@note, UpdatedAt=@u, SyncDirty=0, DeletedAt=NULL WHERE SyncId=@sid";
+                using (var cmd = new SQLiteCommand(sql, con))
+                {
+                    cmd.Parameters.AddWithValue("@sid", syncId);
+                    cmd.Parameters.AddWithValue("@ds", dealerSync);
+                    cmd.Parameters.AddWithValue("@dd", r.Value<double?>("dd_delta") ?? 0);
+                    cmd.Parameters.AddWithValue("@d", r.Value<double?>("d_delta") ?? 0);
+                    cmd.Parameters.AddWithValue("@sk", r.Value<string>("source_kind") ?? "manual");
+                    cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                    cmd.Parameters.AddWithValue("@dt", r.Value<string>("date_text") ?? "");
+                    cmd.Parameters.AddWithValue("@note", r.Value<string>("note") ?? "");
+                    cmd.Parameters.AddWithValue("@u", updated);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            ReconcileDealerBalance(con, sourceSyncId, did, r.Value<double?>("dd_delta") ?? 0, r.Value<double?>("d_delta") ?? 0);
+            return true;
+        }
+
+        private static void BackfillBalanceMarkers(SQLiteConnection con)
+        {
+            if (!TableExists(con, "SyncBalanceApplied")) return;
+            string now = DateTime.UtcNow.ToString("o");
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR IGNORE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  SELECT p.SyncId, p.Did, d.SyncId, 0, IFNULL(p.AmounGiven,0), @now
+                  FROM DieselLedgerCredit p
+                  LEFT JOIN AddDealer d ON d.Did = p.Did
+                  WHERE p.SyncId IS NOT NULL AND trim(p.SyncId) <> ''", con))
+            {
+                cmd.Parameters.AddWithValue("@now", now);
+                cmd.ExecuteNonQuery();
+            }
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR IGNORE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  SELECT p.SyncId, p.Did, d.SyncId, IFNULL(p.AmounGiven,0), 0, @now
+                  FROM DieselLedgerDebit p
+                  LEFT JOIN AddDealer d ON d.Did = p.Did
+                  WHERE p.SyncId IS NOT NULL AND trim(p.SyncId) <> ''", con))
+            {
+                cmd.Parameters.AddWithValue("@now", now);
+                cmd.ExecuteNonQuery();
+            }
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR IGNORE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  SELECT a.SyncId, a.DealerId, d.SyncId, IFNULL(a.AddDisel,0) * IFNULL(a.Rate,0), 0, @now
+                  FROM AddStock a
+                  LEFT JOIN AddDealer d ON d.Did = a.DealerId
+                  WHERE a.SyncId IS NOT NULL AND trim(a.SyncId) <> ''", con))
+            {
+                cmd.Parameters.AddWithValue("@now", now);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void EnsureChildBalanceMarker(SQLiteConnection con, string sourceSyncId, object dealerId, double ddDelta, double dDelta)
+        {
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) return;
+            string dealerSync = DealerSyncId(con, dealerId);
+            int? did = null;
+            if (dealerId != null && dealerId != DBNull.Value)
+                did = Convert.ToInt32(dealerId);
+            string now = DateTime.UtcNow.ToString("o");
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR IGNORE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  VALUES(@src,@did,@ds,@dd,@d,@a)", con))
+            {
+                cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                cmd.Parameters.AddWithValue("@did", (object)did ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@ds", (object)dealerSync ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@dd", ddDelta);
+                cmd.Parameters.AddWithValue("@d", dDelta);
+                cmd.Parameters.AddWithValue("@a", now);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static string DealerSyncId(SQLiteConnection con, object dealerId)
+        {
+            if (dealerId == null || dealerId == DBNull.Value) return null;
+            return GetSyncId(con, "AddDealer", "Did", dealerId);
+        }
+
+        private static void ReconcileDealerBalance(SQLiteConnection con, string sourceSyncId, object dealerId, double ddDelta, double dDelta, bool markDealerDirty = false)
+        {
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) return;
+            int? did = null;
+            if (dealerId != null && dealerId != DBNull.Value)
+                did = Convert.ToInt32(dealerId);
+            string dealerSync = did.HasValue ? DealerSyncId(con, did.Value) : null;
+
+            double prevDd = 0, prevD = 0;
+            int? prevDid = null;
+            using (var cmd = new SQLiteCommand(
+                "SELECT DealerId, DdDelta, DDelta FROM SyncBalanceApplied WHERE SourceSyncId=@s LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@s", sourceSyncId);
+                using (var rd = cmd.ExecuteReader())
+                {
+                    if (rd.Read())
+                    {
+                        if (rd["DealerId"] != DBNull.Value) prevDid = Convert.ToInt32(rd["DealerId"]);
+                        prevDd = ToD(rd["DdDelta"]);
+                        prevD = ToD(rd["DDelta"]);
+                    }
+                }
+            }
+
+            if (prevDid.HasValue && prevDid == did &&
+                Math.Abs(prevDd - ddDelta) < 1e-7 && Math.Abs(prevD - dDelta) < 1e-7)
+                return;
+
+            if (prevDid.HasValue && prevDid.Value > 0)
+                AdjustDealerBalance(con, prevDid.Value, -prevDd, -prevD, markDealerDirty);
+
+            if (did.HasValue && did.Value > 0 && (Math.Abs(ddDelta) > 1e-9 || Math.Abs(dDelta) > 1e-9))
+                AdjustDealerBalance(con, did.Value, ddDelta, dDelta, markDealerDirty);
+
+            if (!did.HasValue || did.Value <= 0 || (Math.Abs(ddDelta) < 1e-9 && Math.Abs(dDelta) < 1e-9))
+            {
+                using (var cmd = new SQLiteCommand("DELETE FROM SyncBalanceApplied WHERE SourceSyncId=@s", con))
+                {
+                    cmd.Parameters.AddWithValue("@s", sourceSyncId);
+                    cmd.ExecuteNonQuery();
+                }
+                return;
+            }
+
+            string now = DateTime.UtcNow.ToString("o");
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR REPLACE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  VALUES(@src,@did,@ds,@dd,@d,@a)", con))
+            {
+                cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                cmd.Parameters.AddWithValue("@did", did.Value);
+                cmd.Parameters.AddWithValue("@ds", (object)dealerSync ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@dd", ddDelta);
+                cmd.Parameters.AddWithValue("@d", dDelta);
+                cmd.Parameters.AddWithValue("@a", now);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void ReverseDealerBalance(SQLiteConnection con, string sourceSyncId, bool markDealerDirty = false)
+        {
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) return;
+            double prevDd = 0, prevD = 0;
+            int? prevDid = null;
+            using (var cmd = new SQLiteCommand(
+                "SELECT DealerId, DdDelta, DDelta FROM SyncBalanceApplied WHERE SourceSyncId=@s LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@s", sourceSyncId);
+                using (var rd = cmd.ExecuteReader())
+                {
+                    if (!rd.Read()) return;
+                    if (rd["DealerId"] != DBNull.Value) prevDid = Convert.ToInt32(rd["DealerId"]);
+                    prevDd = ToD(rd["DdDelta"]);
+                    prevD = ToD(rd["DDelta"]);
+                }
+            }
+            if (prevDid.HasValue && prevDid.Value > 0)
+                AdjustDealerBalance(con, prevDid.Value, -prevDd, -prevD, markDealerDirty);
+            using (var cmd = new SQLiteCommand("DELETE FROM SyncBalanceApplied WHERE SourceSyncId=@s", con))
+            {
+                cmd.Parameters.AddWithValue("@s", sourceSyncId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void AdjustDealerBalance(SQLiteConnection con, int dealerId, double ddDelta, double dDelta, bool markDealerDirty)
+        {
+            if (dealerId <= 0) return;
+            if (Math.Abs(ddDelta) < 1e-9 && Math.Abs(dDelta) < 1e-9) return;
+            string now = DateTime.UtcNow.ToString("o");
+            string sql = markDealerDirty
+                ? "UPDATE AddDealer SET DDAmount = IFNULL(DDAmount,0) + @dd, DAmount = IFNULL(DAmount,0) + @d, UpdatedAt = @u, SyncDirty = 1 WHERE Did = @id"
+                : "UPDATE AddDealer SET DDAmount = IFNULL(DDAmount,0) + @dd, DAmount = IFNULL(DAmount,0) + @d, UpdatedAt = @u WHERE Did = @id";
+            using (var cmd = new SQLiteCommand(sql, con))
+            {
+                cmd.Parameters.AddWithValue("@dd", ddDelta);
+                cmd.Parameters.AddWithValue("@d", dDelta);
+                cmd.Parameters.AddWithValue("@u", now);
+                cmd.Parameters.AddWithValue("@id", dealerId);
+                if (cmd.ExecuteNonQuery() <= 0)
+                    throw new InvalidOperationException("Dealer balance update fail.");
+            }
+        }
+
         private static bool UpsertChild(
             SQLiteConnection con,
             string localTable,
@@ -1894,6 +2259,7 @@ END;";
             }
             if (deleted)
             {
+                ReverseDealerBalance(con, syncId);
                 ApplyRemoteDelete(con, localTable, syncId);
                 return true;
             }
@@ -1919,6 +2285,10 @@ END;";
                     cmd.ExecuteNonQuery();
                 }
             }
+            if (localTable == "DieselLedgerCredit")
+                ReconcileDealerBalance(con, syncId, parentId, 0, r.Value<double?>("amount_given") ?? 0);
+            else if (localTable == "DieselLedgerDebit")
+                ReconcileDealerBalance(con, syncId, parentId, r.Value<double?>("amount_given") ?? 0, 0);
             return true;
         }
     }

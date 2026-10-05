@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:uuid/uuid.dart';
 
 /// Local SQLite sync metadata helpers (no UI).
@@ -6,6 +8,12 @@ class SyncMeta {
 
   /// Set by SyncService.init — any form save/update kicks global push/pull.
   static void Function()? onLocalChange;
+
+  static final StreamController<void> _dataApplied =
+      StreamController<void>.broadcast();
+
+  /// Fired after remote rows were applied locally (pull/flush). UI lists soft-reload.
+  static Stream<void> get onDataApplied => _dataApplied.stream;
 
   static String newId() => uuid.v4();
 
@@ -32,4 +40,8 @@ class SyncMeta {
   }
 
   static void markChanged() => onLocalChange?.call();
+
+  static void notifyDataApplied() {
+    if (!_dataApplied.isClosed) _dataApplied.add(null);
+  }
 }

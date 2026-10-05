@@ -10,6 +10,7 @@ import '../services/sync_service.dart';
 import '../services/vip_export_service.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 import 'login_screen.dart';
@@ -190,7 +191,7 @@ class OwnerCustomerLedgerScreen extends StatefulWidget {
   State<OwnerCustomerLedgerScreen> createState() => _OwnerCustomerLedgerScreenState();
 }
 
-class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
+class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> with SyncAwareReload {
   final _from = TextEditingController();
   final _to = TextEditingController();
   final _vehicleText = TextEditingController();
@@ -227,7 +228,11 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final veh = (_vehicleSelected ?? _vehicleText.text).trim();
@@ -237,13 +242,13 @@ class _OwnerCustomerLedgerScreenState extends State<OwnerCustomerLedgerScreen> {
         from: _from.text.trim().isEmpty ? null : _from.text.trim(),
         to: _to.text.trim().isEmpty ? null : _to.text.trim(),
       );
-      if (!mounted) return;
+      if (!mounted || !isLoadCurrent(gen)) return;
       setState(() {
         _rows = rows;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !isLoadCurrent(gen)) return;
       setState(() {
         _rows = [];
         _loading = false;
@@ -412,7 +417,7 @@ class OwnerDealerLedgerScreen extends StatefulWidget {
   State<OwnerDealerLedgerScreen> createState() => _OwnerDealerLedgerScreenState();
 }
 
-class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
+class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> with SyncAwareReload {
   final _from = TextEditingController();
   final _to = TextEditingController();
   final _vehicleText = TextEditingController();
@@ -449,7 +454,11 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
     super.dispose();
   }
 
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
   Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final veh = (_vehicleSelected ?? _vehicleText.text).trim();
@@ -459,13 +468,13 @@ class _OwnerDealerLedgerScreenState extends State<OwnerDealerLedgerScreen> {
         from: _from.text.trim().isEmpty ? null : _from.text.trim(),
         to: _to.text.trim().isEmpty ? null : _to.text.trim(),
       );
-      if (!mounted) return;
+      if (!mounted || !isLoadCurrent(gen)) return;
       setState(() {
         _rows = rows;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !isLoadCurrent(gen)) return;
       setState(() {
         _rows = [];
         _loading = false;
