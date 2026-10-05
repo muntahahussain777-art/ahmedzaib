@@ -259,6 +259,22 @@ namespace ZaibPetroleumService
         {
             return LocalPersistence.Exec(qry, ht, connection, tx);
         }
+
+        /// <summary>
+        /// Part 3: delete synced row + SyncTombstone so cloud pull cannot resurrect.
+        /// </summary>
+        public static int DeleteWithTombstone(string table, string pkCol, object pk, string cloudTable)
+        {
+            return LocalPersistence.DeleteByPkWithTombstone(table, pkCol, pk, cloudTable);
+        }
+
+        /// <summary>
+        /// Part 3: bulk/side delete with per-row SyncTombstone.
+        /// </summary>
+        public static int DeleteMatchingWithTombstones(string table, string whereSql, Hashtable ht, string cloudTable)
+        {
+            return LocalPersistence.DeleteMatchingWithTombstones(table, whereSql, ht, cloudTable);
+        }
         public static void Enable_reset(Form p)
         {
             foreach (Control c in p.Controls)

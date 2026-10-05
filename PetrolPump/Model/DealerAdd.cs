@@ -160,11 +160,7 @@ namespace ZaibPetroleumService.Model
                 }
 
                 // Agar DieselLedgerCredit mein entry nahi hai to delete karo
-                string qry = "DELETE FROM AddDealer WHERE Did = @id";
-                Hashtable ht = new Hashtable();
-                ht.Add("@id", id);
-
-                int r = MainClass.DataInsertUpdateDelete(qry, ht);
+                int r = MainClass.DeleteWithTombstone("AddDealer", "Did", id, "zaib_dealers");
                 if (r > 0)
                 {
                     CustomeMessage customMessageBox = new CustomeMessage("ڈیلیٹ کامیابی سے ہو گیا۔", "ڈیلیٹ");

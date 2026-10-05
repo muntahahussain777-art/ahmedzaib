@@ -52,9 +52,7 @@ namespace ZaibPetroleumService.Model
                 if (confirmDelete == DialogResult.Yes)
                 {
                     int id = Convert.ToInt32(guna2DataGridView1.CurrentRow.Cells["dgvid"].Value);
-                    string qry = "DELETE FROM PetrolAdd WHERE pid = " + id;
-                    Hashtable ht = new Hashtable();
-                    MainClass.DataInsertUpdateDelete(qry, ht);
+                    MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
                     MessageBox.Show("Record deleted successfully.");
                     LoadData1();
                 }

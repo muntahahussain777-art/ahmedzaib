@@ -715,11 +715,7 @@ namespace ZaibPetroleumService.Model
                     {
                         try
                         {
-                            string qry = "DELETE FROM PetrolAdd WHERE pid = @pid";
-                            Hashtable ht = new Hashtable();
-                            ht.Add("@pid", id);
-
-                            int r = MainClass.DataInsertUpdateDelete(qry, ht);
+                            int r = MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
                             if (r > 0)
                             {
                                 CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");

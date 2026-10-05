@@ -46,9 +46,7 @@ namespace ZaibPetroleumService.View
                     if (confirmDelete == DialogResult.Yes)
                     {
                         int id = Convert.ToInt32(guna2DataGridView1.CurrentRow.Cells["dgvid"].Value);
-                        string qry = "DELETE FROM Expensetable WHERE sid = " + id;
-                        Hashtable ht = new Hashtable();
-                        MainClass.DataInsertUpdateDelete(qry, ht);
+                        MainClass.DeleteWithTombstone("Expensetable", "sid", id, "zaib_expenses");
                         CustomeMessage noDataMessage = new CustomeMessage("Record deleted successfully.", "Info");
                         noDataMessage.ShowDialog();
                     }

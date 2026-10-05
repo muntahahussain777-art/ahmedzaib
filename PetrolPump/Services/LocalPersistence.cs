@@ -120,5 +120,55 @@ namespace ZaibPetroleumService.Services
                 new Hashtable { { "@s", syncId }, { "@t", cloudTable } },
                 connection, tx);
         }
+
+        /// <summary>
+        /// Delete one local row and record SyncTombstone so pull cannot resurrect it.
+        /// Returns rows deleted (0 or 1).
+        /// </summary>
+        public static int DeleteByPkWithTombstone(string table, string pkCol, object pk, string cloudTable)
+        {
+            int deleted = 0;
+            bool ok = RunInTransaction((conn, tx) =>
+            {
+                DataRow row = ReadRow(table, pkCol, pk, conn, tx);
+                if (row == null) return false;
+                string syncId = null;
+                if (row.Table.Columns.Contains("SyncId") && row["SyncId"] != DBNull.Value)
+                    syncId = Convert.ToString(row["SyncId"]);
+                EnsureTombstone(syncId, cloudTable, conn, tx);
+                deleted = Exec(
+                    $"DELETE FROM [{table}] WHERE [{pkCol}] = @id",
+                    new Hashtable { { "@id", pk } },
+                    conn, tx);
+                return deleted > 0;
+            });
+            return ok ? deleted : 0;
+        }
+
+        /// <summary>
+        /// Delete matching rows and tombstone each SyncId (bulk / side-effect deletes).
+        /// whereSql is the predicate only (no WHERE keyword), e.g. "pid = @pid".
+        /// </summary>
+        public static int DeleteMatchingWithTombstones(string table, string whereSql, Hashtable ht, string cloudTable)
+        {
+            int deleted = 0;
+            bool ok = RunInTransaction((conn, tx) =>
+            {
+                DataTable ids = Select(
+                    $"SELECT SyncId FROM [{table}] WHERE {whereSql}",
+                    ht, conn, tx);
+                if (ids != null)
+                {
+                    foreach (DataRow r in ids.Rows)
+                    {
+                        if (r["SyncId"] == DBNull.Value) continue;
+                        EnsureTombstone(Convert.ToString(r["SyncId"]), cloudTable, conn, tx);
+                    }
+                }
+                deleted = Exec($"DELETE FROM [{table}] WHERE {whereSql}", ht, conn, tx);
+                return true;
+            });
+            return ok ? deleted : -1;
+        }
     }
 }

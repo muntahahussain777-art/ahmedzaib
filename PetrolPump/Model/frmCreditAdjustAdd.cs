@@ -453,12 +453,7 @@ namespace ZaibPetroleumService.Model
                     try
                     {
                         // Parameterized query for deletion
-                        string qry = "DELETE FROM PetrolAdd WHERE pid = @pid";
-                        Hashtable ht = new Hashtable();
-                        ht.Add("@pid", id);
-
-                        // Delete operation
-                        int resultDelete = MainClass.DataInsertUpdateDelete(qry, ht);
+                        int resultDelete = MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
 
                         if (resultDelete > 0)
                         {

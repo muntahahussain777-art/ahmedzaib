@@ -220,10 +220,8 @@ namespace ZaibPetroleumService.Model
             {
                 string dateStr = oldDt.ToString("yyyy-MM-dd");
 
-                // 1) PetrolAdd se SIRF EK row delete karo (ROWID + LIMIT 1)
-                string deletePetrolAddQuery = @"
-                    DELETE FROM PetrolAdd
-                    WHERE ROWID IN (
+                // 1) PetrolAdd se SIRF EK row delete karo (ROWID + LIMIT 1) + tombstone
+                string petrolWhere = @"ROWID IN (
                         SELECT ROWID
                         FROM PetrolAdd
                         WHERE CustomerId = @custId
@@ -233,8 +231,7 @@ namespace ZaibPetroleumService.Model
                           AND ReceiptNo = 'DealerPaymentForm'
                         ORDER BY ROWID DESC
                         LIMIT 1
-                    );
-                ";
+                    )";
 
                 Hashtable delParams = new Hashtable
                 {
@@ -242,7 +239,7 @@ namespace ZaibPetroleumService.Model
                     { "@amt",     oldAmt },
                     { "@payDate", dateStr }
                 };
-                MainClass.DataInsertUpdateDelete(deletePetrolAddQuery, delParams);
+                MainClass.DeleteMatchingWithTombstones("PetrolAdd", petrolWhere, delParams, "zaib_petrol_entries");
 
                 // 2) Dealer ke DAmount se purana amount minus karo
                 string undoDealerQuery = "UPDATE AddDealer SET DAmount = DAmount - @amt WHERE Did = @did";
@@ -398,10 +395,8 @@ namespace ZaibPetroleumService.Model
                 if (confirmDelete.ShowDialog() != DialogResult.Yes)
                     return;
 
-                // 1) PetrolAdd se SIRF EK related row remove
-                string deletePetrolAddQuery = @"
-                    DELETE FROM PetrolAdd
-                    WHERE ROWID IN (
+                // 1) PetrolAdd se SIRF EK related row remove + tombstone
+                string petrolWhere = @"ROWID IN (
                         SELECT ROWID
                         FROM PetrolAdd
                         WHERE CustomerId = @custId
@@ -411,15 +406,14 @@ namespace ZaibPetroleumService.Model
                           AND ReceiptNo = 'DealerPaymentForm'
                         ORDER BY ROWID DESC
                         LIMIT 1
-                    );
-                ";
+                    )";
                 Hashtable delPetrolParams = new Hashtable
                 {
                     { "@custId", custId },
                     { "@amt",    oldAmt },
                     { "@dt",     oldDate.ToString("yyyy-MM-dd") }
                 };
-                MainClass.DataInsertUpdateDelete(deletePetrolAddQuery, delPetrolParams);
+                MainClass.DeleteMatchingWithTombstones("PetrolAdd", petrolWhere, delPetrolParams, "zaib_petrol_entries");
 
                 // 2) DieselLedger se row delete
                 string deleteQuery = "DELETE FROM DieselLedger WHERE LedgerID = @Lid";
