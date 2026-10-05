@@ -292,31 +292,12 @@ class SyncService {
     }
 
     try {
-      var outcome = await callRpc(expectedServerRev);
+      final outcome = await callRpc(expectedServerRev);
       if (outcome == null) return UploadAck.unknown;
 
-      // First push after upgrade: learn server_rev then retry once with OCC.
-      if (outcome.status == 'conflict' &&
-          outcome.reason == 'expected_rev_required' &&
-          outcome.serverRev != null &&
-          expectedServerRev == null) {
-        final retryId = const Uuid().v5(Namespace.url.value, '$table|$syncId|$uploadedAt|occ1');
-        try {
-          final raw = await _client
-              .rpc('zaib_sync_apply', params: {
-                'p_table': table,
-                'p_payload': payload,
-                'p_expected_rev': outcome.serverRev,
-                'p_request_id': retryId,
-                'p_allow_restore': false,
-              })
-              .timeout(_httpTimeout);
-          outcome = SyncApplyOutcome.tryParse(raw) ?? outcome;
-        } catch (e) {
-          await _logFail('rpc-retry:$table', syncId, e);
-          return UploadAck.unknown;
-        }
-      }
+      // Do NOT blind-retry on expected_rev_required — that would overwrite cloud
+      // without proving the local edit was based on that revision. Conflict path
+      // stages authoritative server data and keeps local dirty/base version.
 
       // Stash last outcome metadata on the row map for callers (server_rev).
       if (outcome.serverRev != null) {
@@ -326,6 +307,7 @@ class SyncService {
         row['_ack_row'] = outcome.row;
       }
       row['_ack_status'] = outcome.status;
+      row['_ack_reason'] = outcome.reason;
 
       final ack = outcome.ack;
       if (ack == UploadAck.accepted || ack == UploadAck.duplicate) {
@@ -366,7 +348,9 @@ class SyncService {
     required UploadAck ack,
   }) async {
     final ackRev = uploadedRow['_ack_server_rev'];
-    if (ackRev != null) {
+    // Only stamp ServerRev on definite accept/duplicate — never on conflict observation
+    // of a remote row (that would silently advance the local OCC base under a pending edit).
+    if ((ack == UploadAck.accepted || ack == UploadAck.duplicate) && ackRev != null) {
       await _storeServerRev(db, localTable, pkCol, pk, _asInt(ackRev));
     }
 
@@ -449,14 +433,15 @@ class SyncService {
 
     if (server != null) {
       await _stageRemote(db, cloudTable, server);
-      final srv = server['server_rev'];
-      if (srv != null) await _storeServerRev(db, localTable, pkCol, pk, _asInt(srv));
     }
 
     if (action == ConflictReconcile.adoptServerClearDirty && server != null) {
+      final srv = server['server_rev'];
+      final patch = <String, Object?>{'SyncDirty': 0};
+      if (srv != null) patch['ServerRev'] = _asInt(srv);
       await db.update(
         localTable,
-        {'SyncDirty': 0},
+        patch,
         where: '$pkCol = ? AND UpdatedAt = ?',
         whereArgs: [pk, uploadedUpdatedAt],
       );

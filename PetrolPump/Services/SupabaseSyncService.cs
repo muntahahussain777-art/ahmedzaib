@@ -707,17 +707,6 @@ END;";
                 var outcome = await CallSyncApplyAsync(table, uploaded, expectedServerRev, requestId);
                 if (outcome == null) return UploadAck.Unknown;
 
-                if (string.Equals(outcome.Value<string>("status"), "conflict", StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(outcome.Value<string>("reason"), "expected_rev_required", StringComparison.OrdinalIgnoreCase)
-                    && expectedServerRev == null
-                    && outcome["server_rev"] != null && outcome["server_rev"].Type != JTokenType.Null)
-                {
-                    long learned = outcome.Value<long?>("server_rev") ?? 0;
-                    string retryId = StableRequestId(table, syncId, upAt + "|occ1");
-                    outcome = await CallSyncApplyAsync(table, uploaded, learned, retryId) ?? outcome;
-                }
-
-                // Stash for FinishUpload
                 uploaded["_ack_server_rev"] = outcome["server_rev"];
                 uploaded["_ack_row"] = outcome["row"];
                 uploaded["_ack_status"] = outcome["status"];
@@ -801,12 +790,12 @@ END;";
             JObject meta = null;
             if (!string.IsNullOrWhiteSpace(syncId) && LastUpsertMeta.TryGetValue(syncId, out var m))
                 meta = m;
-            long? ackRev = meta?["_ack_server_rev"]?.Value<long?>();
-            if (ackRev.HasValue && ackRev.Value > 0)
-                StoreServerRev(con, localTable, pk, id, ackRev.Value);
-
+            // Only stamp ServerRev on accept/duplicate — never advance OCC base on conflict observation.
             if (ack == UploadAck.Accepted || ack == UploadAck.Duplicate)
             {
+                long? ackRev = meta?["_ack_server_rev"]?.Value<long?>();
+                if (ackRev.HasValue && ackRev.Value > 0)
+                    StoreServerRev(con, localTable, pk, id, ackRev.Value);
                 MarkCleanIfVersion(con, localTable, pk, id, syncId, uploadedUpdatedAt);
                 return;
             }
@@ -845,14 +834,14 @@ END;";
             }
 
             string serverJson2 = null;
+            JObject serverJo = null;
             try
             {
                 if (meta?["_ack_row"] is JObject joAck)
                 {
+                    serverJo = joAck;
                     serverJson2 = joAck.ToString(Formatting.None);
                     StageRemote(con, cloudTable, joAck);
-                    long? srv = joAck.Value<long?>("server_rev");
-                    if (srv.HasValue) StoreServerRev(con, localTable, pk, id, srv.Value);
                 }
                 else
                 {
@@ -863,10 +852,9 @@ END;";
                         var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
                         if (arr.Count > 0 && arr[0] is JObject jo)
                         {
+                            serverJo = jo;
                             serverJson2 = jo.ToString(Formatting.None);
                             StageRemote(con, cloudTable, jo);
-                            long? srv = jo.Value<long?>("server_rev");
-                            if (srv.HasValue) StoreServerRev(con, localTable, pk, id, srv.Value);
                         }
                     }
                 }
@@ -903,6 +891,10 @@ END;";
 
             if (sameVersion)
             {
+                // Adopt server: clear dirty AND take server_rev as new base (local was still at rejected version).
+                long? srv = serverJo?.Value<long?>("server_rev");
+                if (srv.HasValue && srv.Value > 0)
+                    StoreServerRev(con, localTable, pk, id, srv.Value);
                 using (var cmd = new SQLiteCommand(
                     $"UPDATE {localTable} SET SyncDirty=0 WHERE {pk}=@id AND UpdatedAt=@u", con))
                 {
@@ -911,6 +903,7 @@ END;";
                     cmd.ExecuteNonQuery();
                 }
             }
+            // Mid-upload edit: keep dirty and keep prior ServerRev base; staged remote for later.
         }
 
         private static void StoreServerRev(SQLiteConnection con, string localTable, string pk, object id, long rev)
@@ -1132,6 +1125,24 @@ END;";
             }
         }
 
+        private static void PersistObservedServerRev(SQLiteConnection con, string localTable, string syncId, JObject r)
+        {
+            if (string.IsNullOrWhiteSpace(syncId) || r == null) return;
+            long? rev = r.Value<long?>("server_rev");
+            if (!rev.HasValue || rev.Value <= 0) return;
+            try
+            {
+                using (var cmd = new SQLiteCommand(
+                    $"UPDATE {localTable} SET ServerRev=@r WHERE SyncId=@s AND IFNULL(SyncDirty,0)=0", con))
+                {
+                    cmd.Parameters.AddWithValue("@r", rev.Value);
+                    cmd.Parameters.AddWithValue("@s", syncId);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch { }
+        }
+
         private static bool ApplyOneCustomer(SQLiteConnection con, JObject r, bool deleted)
         {
             string syncId = r.Value<string>("sync_id");
@@ -1174,6 +1185,7 @@ END;";
                     }
                 }
             }
+            PersistObservedServerRev(con, "AddCustomer", syncId, r);
             return true;
         }
 
@@ -1217,6 +1229,7 @@ END;";
                     }
                 }
             }
+            PersistObservedServerRev(con, "AddDealer", syncId, r);
             return true;
         }
 
@@ -1267,6 +1280,7 @@ END;";
                     RequireApplyRows(cmd.ExecuteNonQuery(), exists == null ? "insert:PetrolAdd" : "update:PetrolAdd", syncId);
                 }
             }
+            PersistObservedServerRev(con, "PetrolAdd", syncId, r);
             return true;
         }
 
@@ -1318,6 +1332,7 @@ END;";
             double addDiesel = r.Value<double?>("add_diesel") ?? 0;
             double rate = r.Value<double?>("rate") ?? 0;
             ReconcileDealerBalance(con, syncId, did, addDiesel * rate, 0);
+            PersistObservedServerRev(con, "AddStock", syncId, r);
             return true;
         }
 
@@ -1363,6 +1378,7 @@ END;";
                     RequireApplyRows(cmd.ExecuteNonQuery(), exists == null ? "insert:StockDiesel" : "update:StockDiesel", syncId);
                 }
             }
+            PersistObservedServerRev(con, "StockDiesel", syncId, r);
             return true;
         }
 
@@ -1410,6 +1426,7 @@ END;";
                     RequireApplyRows(cmd.ExecuteNonQuery(), exists == null ? "insert:BankTransactions" : "update:BankTransactions", syncId);
                 }
             }
+            PersistObservedServerRev(con, "BankTransactions", syncId, r);
             return true;
         }
 
@@ -1445,6 +1462,7 @@ END;";
                     RequireApplyRows(cmd.ExecuteNonQuery(), exists == null ? "insert:Expensetable" : "update:Expensetable", syncId);
                 }
             }
+            PersistObservedServerRev(con, "Expensetable", syncId, r);
             return true;
         }
 
@@ -1542,6 +1560,7 @@ END;";
             }
             ReconcileDealerBalance(con, syncId + ":from", fromId, 0, amount);
             ReconcileDealerBalance(con, syncId + ":to", toId, amount, 0);
+            PersistObservedServerRev(con, "DealertoDealer", syncId, r);
             return true;
         }
 
@@ -2856,6 +2875,7 @@ END;";
                 }
             }
             ReconcileDealerBalance(con, sourceSyncId, did, r.Value<double?>("dd_delta") ?? 0, r.Value<double?>("d_delta") ?? 0);
+            PersistObservedServerRev(con, "SyncDealerBalanceOp", syncId, r);
             return true;
         }
 
@@ -3084,6 +3104,7 @@ END;";
                 ReconcileDealerBalance(con, syncId, parentId, 0, r.Value<double?>("amount_given") ?? 0);
             else if (localTable == "DieselLedgerDebit")
                 ReconcileDealerBalance(con, syncId, parentId, r.Value<double?>("amount_given") ?? 0, 0);
+            if (r is JObject joRev) PersistObservedServerRev(con, localTable, syncId, joRev);
             return true;
         }
     }
