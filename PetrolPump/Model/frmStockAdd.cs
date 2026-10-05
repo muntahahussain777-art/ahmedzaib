@@ -373,6 +373,8 @@ namespace ZaibPetroleumService.Model
                                     conn, tx) <= 0)
                                 return false;
                         }
+                        long sid = Convert.ToInt64(LocalPersistence.Scalar("SELECT last_insert_rowid()", null, conn, tx));
+                        SupabaseSyncService.RecordLocalChildBalanceEffect(conn, tx, "AddStock", "Sid", sid);
                         return true;
                     }
 
@@ -408,6 +410,7 @@ namespace ZaibPetroleumService.Model
                                 conn, tx) <= 0)
                             return false;
                     }
+                    SupabaseSyncService.RecordLocalChildBalanceEffect(conn, tx, "AddStock", "Sid", saveId);
                     return true;
                 });
 
@@ -490,6 +493,7 @@ namespace ZaibPetroleumService.Model
                                         conn, tx) <= 0)
                                     return false;
                             }
+                            SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId);
                             return true;
                         });
 

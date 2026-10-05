@@ -13,7 +13,7 @@ import 'supabase_config.dart';
 import 'sync_meta.dart';
 import 'sync_policy.dart';
 
-/// Silent offline-first sync: Mobile ↔ Supabase ↔ WinForms.
+/// Silent offline-first sync: Mobile ? Supabase ? WinForms.
 /// Serialized pass; dependency-safe push; version-ack mark-clean; pull protects dirty/tombstones.
 class SyncService {
   SyncService._();
@@ -113,7 +113,7 @@ class SyncService {
     return id;
   }
 
-  /// One serialized sync pass. Timeouts on HTTP only — never clear the lock early.
+  /// One serialized sync pass. Timeouts on HTTP only � never clear the lock early.
   Future<void> syncNow() async {
     if (_running) {
       _queued = true;
@@ -146,7 +146,7 @@ class SyncService {
 
     final deviceId = await _ensureDeviceId();
 
-    // Tombstones + dirty first (parents→children), then protected pull.
+    // Tombstones + dirty first (parents?children), then protected pull.
     // Not a naive order swap: pull still cannot overwrite pending/tombstones.
     try {
       await _pushTombstones(deviceId);
@@ -346,11 +346,11 @@ class SyncService {
     });
 
     if (server != null) {
-      await _stageRemote(cloudTable, server);
+      await _stageRemote(db, cloudTable, server);
     }
 
     if (action == ConflictReconcile.adoptServerClearDirty && server != null) {
-      // Exact rejected version still local — adopt authoritative server, clear dirty.
+      // Exact rejected version still local - adopt authoritative server, clear dirty.
       await db.update(
         localTable,
         {'SyncDirty': 0},
@@ -366,27 +366,32 @@ class SyncService {
     String table, {
     required String sinceUpdatedAt,
     required String sinceSyncId,
-    required int from,
   }) async {
-    // Pull updated_at >= cursor, then drop rows already at/before (updated_at, sync_id).
-    // Timestamp+offset alone is insufficient; sync_id tie-break keeps equal-ts rows.
-    final raw = await _table(table)
-        .select()
-        .gte('updated_at', sinceUpdatedAt)
-        .order('updated_at', ascending: true)
-        .order('sync_id', ascending: true)
-        .range(from, from + _pageSize - 1)
-        .timeout(_httpTimeout);
-    final rows = raw.map((row) => Map<String, dynamic>.from(row)).toList();
-    return rows.where((r) {
-      final u = r['updated_at']?.toString() ?? '';
-      final s = r['sync_id']?.toString() ?? '';
-      if (u.isEmpty) return false;
-      final cmp = SyncPolicy.parseTs(u).compareTo(SyncPolicy.parseTs(sinceUpdatedAt));
-      if (cmp > 0) return true;
-      if (cmp < 0) return false;
-      return s.compareTo(sinceSyncId) > 0;
-    }).toList();
+    // Server-side keyset � do not gte+offset then filter locally (that can stop early).
+    // Late offline rows older than the watermark are not returned; push-before-pull covers them.
+    final filter = SyncPolicy.keysetFilter(updatedAt: sinceUpdatedAt, syncId: sinceSyncId);
+    // supabase_flutter FilterBuilder: use raw filter via .or / .gte
+    late final List<dynamic> raw;
+    if (sinceSyncId.isEmpty) {
+      raw = await _table(table)
+          .select()
+          .gte('updated_at', sinceUpdatedAt)
+          .order('updated_at', ascending: true)
+          .order('sync_id', ascending: true)
+          .limit(_pageSize)
+          .timeout(_httpTimeout);
+    } else {
+      raw = await _table(table)
+          .select()
+          .or('and(updated_at.eq.$sinceUpdatedAt,sync_id.gt.$sinceSyncId),updated_at.gt.$sinceUpdatedAt')
+          .order('updated_at', ascending: true)
+          .order('sync_id', ascending: true)
+          .limit(_pageSize)
+          .timeout(_httpTimeout);
+    }
+    // Keep filter string referenced for debugging/tests parity with WinForms.
+    assert(filter.isNotEmpty);
+    return raw.map((row) => Map<String, dynamic>.from(row as Map)).toList();
   }
 
   Future<String> _checkpoint(String cloudTable) async {
@@ -402,8 +407,7 @@ class SyncService {
     await prefs.setString('$_prefsLastPullPrefix$cloudTable', SyncPolicy.encodeCursor(updatedAt, syncId));
   }
 
-  Future<void> _upsertLocal(
-    Database db,
+  Future<void> _upsertLocal(DatabaseExecutor db,
     String table,
     String syncId,
     Map<String, Object?> map,
@@ -420,15 +424,15 @@ class SyncService {
     }
   }
 
-  Future<bool> _hasTombstone(Database db, String syncId) async {
+  Future<bool> _hasTombstone(DatabaseExecutor db, String syncId) async {
     final rows = await db.query('SyncTombstone', columns: ['SyncId'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
     return rows.isNotEmpty;
   }
 
-  /// Remote soft-delete → local delete without leaving SyncTombstone (no push loop).
-  Future<void> _applyRemoteDelete(Database db, String table, String syncId) async {
+  /// Remote soft-delete ? local delete without leaving SyncTombstone (no push loop).
+  Future<void> _applyRemoteDelete(DatabaseExecutor db, String table, String syncId) async {
     if (await _hasTombstone(db, syncId)) {
-      // Local delete pending upload — keep tombstone; do not clear until push ack.
+      // Local delete pending upload � keep tombstone; do not clear until push ack.
       return;
     }
     final rows = await db.query(table, columns: ['SyncDirty'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
@@ -444,8 +448,7 @@ class SyncService {
     await db.delete('SyncTombstone', where: 'SyncId = ?', whereArgs: [syncId]);
   }
 
-  Future<RemoteApplyDecision> _remoteDecision(
-    Database db,
+  Future<RemoteApplyDecision> _remoteDecision(DatabaseExecutor db,
     String table,
     String syncId,
     String remoteUpdated, {
@@ -499,7 +502,7 @@ class SyncService {
 
   /// Returns true if caller should apply remote now. Stages when blocked by pending local.
   Future<bool> _gateRemoteApply(
-    Database db,
+    DatabaseExecutor db,
     String localTable,
     String cloudTable,
     String syncId,
@@ -518,13 +521,13 @@ class SyncService {
     );
     if (d == RemoteApplyDecision.apply) return true;
     if (d == RemoteApplyDecision.skipStage) {
-      await _stageRemote(cloudTable, r);
+      await _stageRemote(db, cloudTable, r);
     }
+    // skipStage (durable) and skipDone: allow cursor to advance
     return false;
   }
 
-  Future<void> _stageRemote(String cloudTable, Map<String, dynamic> row) async {
-    final db = await AppDatabase.instance.database;
+  Future<void> _stageRemote(DatabaseExecutor db, String cloudTable, Map<String, dynamic> row) async {
     final syncId = row['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return;
     await db.insert(
@@ -1037,7 +1040,7 @@ class SyncService {
     await safe(() => _pullTable('zaib_customers', _applyCustomer));
     await safe(() => _pullTable('zaib_dealers', _applyDealer));
     await safe(() => _pullTable('zaib_petrol_entries', _applyPetrol));
-    // Value-fingerprint auto-purge disabled — SyncId is identity; identical values may both be real.
+    // Value-fingerprint auto-purge disabled � SyncId is identity; identical values may both be real.
     await safe(() => _pullTable('zaib_dealer_payouts', _applyPayout));
     await safe(() => _pullTable('zaib_dealer_purchases', _applyPurchase));
     await safe(() => _pullTable('zaib_dealer_direct', _applyDirect));
@@ -1049,13 +1052,12 @@ class SyncService {
 
   Future<void> _pullTable(
     String cloudTable,
-    Future<bool> Function(Database db, Map<String, dynamic> r) apply,
+    Future<bool> Function(DatabaseExecutor db, Map<String, dynamic> r) apply,
   ) async {
     final db = await AppDatabase.instance.database;
     final cursor = SyncPolicy.decodeCursor(await _checkpoint(cloudTable));
     var sinceUpdated = cursor.$1;
     var sinceSync = cursor.$2;
-    var from = 0;
     var appliedUpdated = sinceUpdated;
     var appliedSync = sinceSync;
 
@@ -1064,13 +1066,14 @@ class SyncService {
         cloudTable,
         sinceUpdatedAt: sinceUpdated,
         sinceSyncId: sinceSync,
-        from: from,
       );
       if (page.isEmpty) break;
+
       for (final r in page) {
         final updated = r['updated_at']?.toString() ?? '';
         final syncId = r['sync_id']?.toString() ?? '';
-        final ok = await apply(db, r);
+        // Each remote apply is one SQLite transaction (entry + balance + marker + stage).
+        final ok = await db.transaction((txn) => apply(txn, r));
         if (ok && updated.isNotEmpty) {
           final cmp = SyncPolicy.parseTs(updated).compareTo(SyncPolicy.parseTs(appliedUpdated));
           if (cmp > 0 || (cmp == 0 && syncId.compareTo(appliedSync) > 0)) {
@@ -1079,12 +1082,20 @@ class SyncService {
           }
         }
       }
+
       if (appliedUpdated != sinceUpdated || appliedSync != sinceSync) {
         await _saveCheckpoint(cloudTable, appliedUpdated, appliedSync);
-        // Next page within same since uses offset; when using composite filter, reset offset after watermark move.
       }
-      if (page.length < _pageSize) break;
-      from += _pageSize;
+
+      // Exhaustion from raw server page size � never a client-filtered subset.
+      if (!SyncPolicy.serverPageHasMore(rawPageLength: page.length, pageSize: _pageSize)) {
+        break;
+      }
+
+      // Walk keyset to last raw row so the next request cannot re-scan the same page.
+      final last = page.last;
+      sinceUpdated = last['updated_at']?.toString() ?? sinceUpdated;
+      sinceSync = last['sync_id']?.toString() ?? sinceSync;
     }
   }
 
@@ -1094,54 +1105,56 @@ class SyncService {
     for (final s in staged) {
       final cloud = s['CloudTable']?.toString() ?? '';
       final json = s['PayloadJson']?.toString() ?? '';
+      final stagedSync = s['SyncId']?.toString() ?? '';
       if (cloud.isEmpty || json.isEmpty) continue;
       try {
         final row = Map<String, dynamic>.from(jsonDecode(json) as Map);
-        bool ok = false;
-        switch (cloud) {
-          case 'zaib_customers':
-            ok = await _applyCustomer(db, row);
-            break;
-          case 'zaib_dealers':
-            ok = await _applyDealer(db, row);
-            break;
-          case 'zaib_petrol_entries':
-            ok = await _applyPetrol(db, row);
-            break;
-          case 'zaib_dealer_payouts':
-            ok = await _applyPayout(db, row);
-            break;
-          case 'zaib_dealer_purchases':
-            ok = await _applyPurchase(db, row);
-            break;
-          case 'zaib_dealer_direct':
-            ok = await _applyDirect(db, row);
-            break;
-          case 'zaib_stock_diesel':
-            ok = await _applyStock(db, row);
-            break;
-          case 'zaib_bank_transactions':
-            ok = await _applyBank(db, row);
-            break;
-          case 'zaib_expenses':
-            ok = await _applyExpense(db, row);
-            break;
-          case 'zaib_dealer_balance_ops':
-            ok = await _applyBalanceOp(db, row);
-            break;
-          default:
-            await _logFail('flush:unknown:$cloud', s['SyncId']?.toString(), 'unknown staged table — kept');
-            ok = false;
-        }
-        if (ok) {
-          await db.delete(
-            'SyncStagedRemote',
-            where: 'CloudTable = ? AND SyncId = ?',
-            whereArgs: [cloud, s['SyncId']],
-          );
-        }
+        await db.transaction((txn) async {
+          bool ok;
+          switch (cloud) {
+            case 'zaib_customers':
+              ok = await _applyCustomer(txn, row);
+              break;
+            case 'zaib_dealers':
+              ok = await _applyDealer(txn, row);
+              break;
+            case 'zaib_petrol_entries':
+              ok = await _applyPetrol(txn, row);
+              break;
+            case 'zaib_dealer_payouts':
+              ok = await _applyPayout(txn, row);
+              break;
+            case 'zaib_dealer_purchases':
+              ok = await _applyPurchase(txn, row);
+              break;
+            case 'zaib_dealer_direct':
+              ok = await _applyDirect(txn, row);
+              break;
+            case 'zaib_stock_diesel':
+              ok = await _applyStock(txn, row);
+              break;
+            case 'zaib_bank_transactions':
+              ok = await _applyBank(txn, row);
+              break;
+            case 'zaib_expenses':
+              ok = await _applyExpense(txn, row);
+              break;
+            case 'zaib_dealer_balance_ops':
+              ok = await _applyBalanceOp(txn, row);
+              break;
+            default:
+              throw StateError('unknown staged table');
+          }
+          if (ok && stagedSync.isNotEmpty) {
+            await txn.delete(
+              'SyncStagedRemote',
+              where: 'CloudTable = ? AND SyncId = ?',
+              whereArgs: [cloud, stagedSync],
+            );
+          }
+        });
       } catch (e) {
-        await _logFail('flush:$cloud', s['SyncId']?.toString(), e);
+        await _logFail('flush:$cloud', stagedSync, e);
       }
     }
   }
@@ -1169,7 +1182,7 @@ class SyncService {
     return s.isNotEmpty && s.toLowerCase() != 'null';
   }
 
-  Future<int?> _localIdBySync(Database db, String table, String pkCol, String? syncId) async {
+  Future<int?> _localIdBySync(DatabaseExecutor db, String table, String pkCol, String? syncId) async {
     if (syncId == null || syncId.isEmpty) return null;
     final rows = await db.query(table, columns: [pkCol], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
     if (rows.isEmpty) return null;
@@ -1178,14 +1191,14 @@ class SyncService {
     return int.tryParse('$v');
   }
 
-  Future<bool> _applyCustomer(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyCustomer(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
     final deleted = _isDeleted(r['deleted_at']);
     final device = r['device_id']?.toString();
     if (!await _gateRemoteApply(db, 'AddCustomer', 'zaib_customers', syncId, updated, r, remoteDeleted: deleted, remoteDeviceId: device)) {
-      return true; // staged or skipDone — cursor may advance
+      return true; // staged or skipDone � cursor may advance
     }
     if (deleted) {
       await _applyRemoteDelete(db, 'AddCustomer', syncId);
@@ -1202,7 +1215,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyDealer(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyDealer(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1217,7 +1230,7 @@ class SyncService {
     }
     final existing = await db.query('AddDealer', columns: ['Did'], where: 'SyncId = ?', whereArgs: [syncId], limit: 1);
     if (existing.isNotEmpty) {
-      // Never overwrite DD/D from absolute remote values — children + balance_ops own aggregates.
+      // Never overwrite DD/D from absolute remote values � children + balance_ops own aggregates.
       await _upsertLocal(db, 'AddDealer', syncId, {
         'DealerName': _asStr(r['dealer_name']),
         'Date': _asStr(r['date_text']),
@@ -1229,7 +1242,7 @@ class SyncService {
     }
     await _upsertLocal(db, 'AddDealer', syncId, {
       'DealerName': _asStr(r['dealer_name']),
-      // Opening/manual/children arrive via balance_ops + child reconcile — avoid absolute+child double count.
+      // Opening/manual/children arrive via balance_ops + child reconcile � avoid absolute+child double count.
       'DDAmount': 0,
       'DAmount': 0,
       'Date': _asStr(r['date_text']),
@@ -1240,7 +1253,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyPetrol(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyPetrol(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1256,8 +1269,8 @@ class SyncService {
     final custSync = r['customer_sync_id']?.toString();
     final custId = await _localIdBySync(db, 'AddCustomer', 'id', custSync);
     if (custSync != null && custSync.isNotEmpty && custId == null) {
-      await _stageRemote('zaib_petrol_entries', r);
-      return false;
+      await _stageRemote(db, 'zaib_petrol_entries', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'PetrolAdd', syncId, {
       'Date': _asStr(r['date_text']),
@@ -1280,7 +1293,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyPayout(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyPayout(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1296,8 +1309,8 @@ class SyncService {
     final dSync = r['dealer_sync_id']?.toString();
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dSync);
     if (dSync != null && dSync.isNotEmpty && did == null) {
-      await _stageRemote('zaib_dealer_payouts', r);
-      return false;
+      await _stageRemote(db, 'zaib_dealer_payouts', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'DieselLedgerCredit', syncId, {
       'Did': did,
@@ -1320,7 +1333,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyPurchase(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyPurchase(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1336,8 +1349,8 @@ class SyncService {
     final dSync = r['dealer_sync_id']?.toString();
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dSync);
     if (dSync != null && dSync.isNotEmpty && did == null) {
-      await _stageRemote('zaib_dealer_purchases', r);
-      return false;
+      await _stageRemote(db, 'zaib_dealer_purchases', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'AddStock', syncId, {
       'Vehicle': _asStr(r['vehicle']),
@@ -1365,7 +1378,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyDirect(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyDirect(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1381,8 +1394,8 @@ class SyncService {
     final dSync = r['dealer_sync_id']?.toString();
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dSync);
     if (dSync != null && dSync.isNotEmpty && did == null) {
-      await _stageRemote('zaib_dealer_direct', r);
-      return false;
+      await _stageRemote(db, 'zaib_dealer_direct', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'DieselLedgerDebit', syncId, {
       'Did': did,
@@ -1405,7 +1418,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyStock(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyStock(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1421,8 +1434,8 @@ class SyncService {
     final dSync = r['dealer_sync_id']?.toString();
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dSync);
     if (dSync != null && dSync.isNotEmpty && did == null) {
-      await _stageRemote('zaib_stock_diesel', r);
-      return false;
+      await _stageRemote(db, 'zaib_stock_diesel', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'StockDiesel', syncId, {
       'SDid': did,
@@ -1440,7 +1453,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyBank(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyBank(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1459,8 +1472,8 @@ class SyncService {
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dSync);
     if ((cSync != null && cSync.isNotEmpty && cid == null) ||
         (dSync != null && dSync.isNotEmpty && did == null)) {
-      await _stageRemote('zaib_bank_transactions', r);
-      return false;
+      await _stageRemote(db, 'zaib_bank_transactions', r);
+      return true; // durable stage - checkpoint may advance
     }
     await _upsertLocal(db, 'BankTransactions', syncId, {
       'TransactionDate': _asStr(r['transaction_date']),
@@ -1477,7 +1490,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyExpense(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyExpense(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1503,7 +1516,7 @@ class SyncService {
     return true;
   }
 
-  Future<bool> _applyBalanceOp(Database db, Map<String, dynamic> r) async {
+  Future<bool> _applyBalanceOp(DatabaseExecutor db, Map<String, dynamic> r) async {
     final syncId = r['sync_id']?.toString() ?? '';
     if (syncId.isEmpty) return true;
     final updated = r['updated_at']?.toString() ?? SyncMeta.nowIso();
@@ -1521,8 +1534,8 @@ class SyncService {
     final dealerSync = r['dealer_sync_id']?.toString() ?? '';
     final did = await _localIdBySync(db, 'AddDealer', 'Did', dealerSync);
     if (dealerSync.isNotEmpty && did == null) {
-      await _stageRemote('zaib_dealer_balance_ops', r);
-      return false;
+      await _stageRemote(db, 'zaib_dealer_balance_ops', r);
+      return true; // durable stage - checkpoint may advance
     }
     await DealerBalanceApply.reconcile(
       db: db,

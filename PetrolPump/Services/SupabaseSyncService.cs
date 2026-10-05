@@ -176,6 +176,14 @@ namespace ZaibPetroleumService.Services
                     DatabaseSchemaManager.EnsureColumn(con, t, "UpdatedAt", "TEXT");
                     DatabaseSchemaManager.EnsureColumn(con, t, "SyncDirty", "INTEGER DEFAULT 1");
                 }
+                // DealertoDealer: local-only until cloud schema is approved (see DatabaseScripts/*_SYNC_PENDING.sql).
+                if (TableExistsLocal(con, "DealertoDealer"))
+                {
+                    DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "SyncId", "TEXT");
+                    DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "UpdatedAt", "TEXT");
+                    DatabaseSchemaManager.EnsureColumn(con, "DealertoDealer", "SyncDirty", "INTEGER DEFAULT 1");
+                    BackfillSyncIds(con, "DealertoDealer", "LedgerID");
+                }
 
                 Exec(con, @"CREATE TABLE IF NOT EXISTS SyncTombstone (
                     SyncId TEXT PRIMARY KEY,
@@ -395,6 +403,16 @@ END;";
             }
         }
 
+        private static bool TableExistsLocal(SQLiteConnection con, string tableName)
+        {
+            using (var cmd = new SQLiteCommand(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=@n LIMIT 1", con))
+            {
+                cmd.Parameters.AddWithValue("@n", tableName);
+                return cmd.ExecuteScalar() != null;
+            }
+        }
+
         private static void Exec(SQLiteConnection con, string sql)
         {
             using (var cmd = new SQLiteCommand(sql, con))
@@ -526,39 +544,95 @@ END;";
             if (string.IsNullOrWhiteSpace(dealerSyncId) || (Math.Abs(ddDelta) < 1e-9 && Math.Abs(dDelta) < 1e-9))
                 return;
             EnsureLocalSyncReady();
-            using (var con = new SQLiteConnection(projectconnection.ConnectionString))
+            MainClass.RunInTransaction((con, tx) =>
+                EnqueueDealerBalanceOpInTx(con, tx, dealerId, dealerSyncId, ddDelta, dDelta, dateText, sourceKind, fixedSourceSyncId));
+        }
+
+        /// <summary>Queue balance op + idempotency marker in an open transaction (dealer row already saved).</summary>
+        public static bool EnqueueDealerBalanceOpInTx(
+            SQLiteConnection con, SQLiteTransaction tx,
+            int dealerId, string dealerSyncId, double ddDelta, double dDelta, string dateText,
+            string sourceKind, string fixedSourceSyncId)
+        {
+            if (string.IsNullOrWhiteSpace(dealerSyncId) || (Math.Abs(ddDelta) < 1e-9 && Math.Abs(dDelta) < 1e-9))
+                return true;
+            string opSyncId = Guid.NewGuid().ToString();
+            string sourceSyncId = string.IsNullOrWhiteSpace(fixedSourceSyncId) ? opSyncId : fixedSourceSyncId;
+            string kind = string.IsNullOrWhiteSpace(sourceKind) ? "manual" : sourceKind;
+            string now = DateTime.UtcNow.ToString("o");
+            using (var cmd = new SQLiteCommand(
+                @"INSERT INTO SyncDealerBalanceOp(SyncId,DealerSyncId,DdDelta,DDelta,SourceKind,SourceSyncId,DateText,UpdatedAt,SyncDirty,DeletedAt)
+                  VALUES(@sid,@ds,@dd,@d,@sk,@src,@dt,@u,1,NULL)", con, tx))
             {
-                con.Open();
-                string syncId = Guid.NewGuid().ToString();
-                string sourceSyncId = string.IsNullOrWhiteSpace(fixedSourceSyncId) ? syncId : fixedSourceSyncId;
-                string kind = string.IsNullOrWhiteSpace(sourceKind) ? "manual" : sourceKind;
-                string now = DateTime.UtcNow.ToString("o");
-                using (var cmd = new SQLiteCommand(
-                    @"INSERT INTO SyncDealerBalanceOp(SyncId,DealerSyncId,DdDelta,DDelta,SourceKind,SourceSyncId,DateText,UpdatedAt,SyncDirty,DeletedAt)
-                      VALUES(@sid,@ds,@dd,@d,@sk,@src,@dt,@u,1,NULL)", con))
-                {
-                    cmd.Parameters.AddWithValue("@sid", syncId);
-                    cmd.Parameters.AddWithValue("@ds", dealerSyncId);
-                    cmd.Parameters.AddWithValue("@dd", ddDelta);
-                    cmd.Parameters.AddWithValue("@d", dDelta);
-                    cmd.Parameters.AddWithValue("@sk", kind);
-                    cmd.Parameters.AddWithValue("@src", sourceSyncId);
-                    cmd.Parameters.AddWithValue("@dt", (object)dateText ?? DBNull.Value);
-                    cmd.Parameters.AddWithValue("@u", now);
-                    cmd.ExecuteNonQuery();
-                }
-                using (var cmd = new SQLiteCommand(
-                    @"INSERT OR REPLACE INTO SyncBalanceApplied(SourceSyncId,DealerId,DealerSyncId,DdDelta,DDelta,AppliedAt)
-                      VALUES(@src,@did,@ds,@dd,@d,@a)", con))
-                {
-                    cmd.Parameters.AddWithValue("@src", sourceSyncId);
-                    cmd.Parameters.AddWithValue("@did", dealerId);
-                    cmd.Parameters.AddWithValue("@ds", dealerSyncId);
-                    cmd.Parameters.AddWithValue("@dd", ddDelta);
-                    cmd.Parameters.AddWithValue("@d", dDelta);
-                    cmd.Parameters.AddWithValue("@a", now);
-                    cmd.ExecuteNonQuery();
-                }
+                cmd.Parameters.AddWithValue("@sid", opSyncId);
+                cmd.Parameters.AddWithValue("@ds", dealerSyncId);
+                cmd.Parameters.AddWithValue("@dd", ddDelta);
+                cmd.Parameters.AddWithValue("@d", dDelta);
+                cmd.Parameters.AddWithValue("@sk", kind);
+                cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                cmd.Parameters.AddWithValue("@dt", (object)dateText ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@u", now);
+                if (cmd.ExecuteNonQuery() <= 0) return false;
+            }
+            SetBalanceMarkerOnly(con, tx, sourceSyncId, dealerId, ddDelta, dDelta);
+            return true;
+        }
+
+        /// <summary>Record that a child row's balance effect was applied locally (does not adjust DD/D).</summary>
+        public static void SetBalanceMarkerOnly(
+            SQLiteConnection con, SQLiteTransaction tx,
+            string sourceSyncId, object dealerId, double ddDelta, double dDelta)
+        {
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) return;
+            string dealerSync = DealerSyncId(con, dealerId);
+            int? did = null;
+            if (dealerId != null && dealerId != DBNull.Value)
+                did = Convert.ToInt32(dealerId);
+            string now = DateTime.UtcNow.ToString("o");
+            using (var cmd = new SQLiteCommand(
+                @"INSERT OR REPLACE INTO SyncBalanceApplied(SourceSyncId, DealerId, DealerSyncId, DdDelta, DDelta, AppliedAt)
+                  VALUES(@src,@did,@ds,@dd,@d,@a)", con, tx))
+            {
+                cmd.Parameters.AddWithValue("@src", sourceSyncId);
+                cmd.Parameters.AddWithValue("@did", (object)did ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@ds", (object)dealerSync ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@dd", ddDelta);
+                cmd.Parameters.AddWithValue("@d", dDelta);
+                cmd.Parameters.AddWithValue("@a", now);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>After local delete reversed DD/D, drop marker so pull does not re-apply.</summary>
+        public static void DeleteBalanceMarkerOnly(SQLiteConnection con, SQLiteTransaction tx, string sourceSyncId)
+        {
+            if (string.IsNullOrWhiteSpace(sourceSyncId)) return;
+            using (var cmd = new SQLiteCommand("DELETE FROM SyncBalanceApplied WHERE SourceSyncId=@s", con, tx))
+            {
+                cmd.Parameters.AddWithValue("@s", sourceSyncId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>Wire forms: marker only after local balance already updated in same transaction.</summary>
+        public static void RecordLocalChildBalanceEffect(
+            SQLiteConnection con, SQLiteTransaction tx, string localTable, string pkCol, object pk)
+        {
+            DataRow row = LocalPersistence.ReadRow(localTable, pkCol, pk, con, tx);
+            if (row == null) return;
+            string syncId = row.Table.Columns.Contains("SyncId") ? Convert.ToString(row["SyncId"]) : null;
+            if (string.IsNullOrWhiteSpace(syncId)) return;
+            switch (localTable)
+            {
+                case "DieselLedgerCredit":
+                    SetBalanceMarkerOnly(con, tx, syncId, row["Did"], 0, ToD(row["AmounGiven"]));
+                    break;
+                case "DieselLedgerDebit":
+                    SetBalanceMarkerOnly(con, tx, syncId, row["Did"], ToD(row["AmounGiven"]), 0);
+                    break;
+                case "AddStock":
+                    SetBalanceMarkerOnly(con, tx, syncId, row["DealerId"], ToD(row["AddDisel"]) * ToD(row["Rate"]), 0);
+                    break;
             }
         }
 
@@ -687,39 +761,46 @@ END;";
 
         private static async Task<List<JObject>> SelectSincePagedAsync(string table)
         {
+            // Timestamp cursors do not see late-arriving offline rows with updated_at older than the checkpoint.
+            // Clients must push dirty rows/tombstones first (push-before-pull); peer pull only sees rows newer than the watermark.
             var all = new List<JObject>();
             SplitCheckpoint(GetCheckpoint(table), out string sinceAt, out string sinceId);
-            int from = 0;
             while (true)
             {
-                // gte updated_at then client-filter by (updated_at, sync_id) composite cursor
+                string filter;
+                if (string.IsNullOrWhiteSpace(sinceId))
+                {
+                    filter = $"updated_at=gte.{Uri.EscapeDataString(sinceAt)}";
+                }
+                else
+                {
+                    string escAt = Uri.EscapeDataString(sinceAt);
+                    string escId = Uri.EscapeDataString(sinceId);
+                    filter = $"or=(and(updated_at.eq.{escAt},sync_id.gt.{escId}),updated_at.gt.{escAt})";
+                }
                 string url =
-                    $"{Url}/rest/v1/{table}?select=*&updated_at=gte.{Uri.EscapeDataString(sinceAt)}" +
-                    $"&order=updated_at.asc,sync_id.asc&limit={PageSize}&offset={from}";
+                    $"{Url}/rest/v1/{table}?select=*&{filter}" +
+                    $"&order=updated_at.asc,sync_id.asc&limit={PageSize}";
                 var res = await Http.GetAsync(url);
                 res.EnsureSuccessStatusCode();
                 string body = await res.Content.ReadAsStringAsync();
                 var arr = JArray.Parse(string.IsNullOrWhiteSpace(body) ? "[]" : body);
-                int kept = 0;
+                if (arr.Count == 0) break;
+                JObject last = null;
                 foreach (var t in arr)
                 {
                     if (t is JObject jo)
                     {
-                        string u = jo.Value<string>("updated_at") ?? "";
-                        string s = jo.Value<string>("sync_id") ?? "";
-                        DateTime du = DateTime.TryParse(u, out var ut) ? ut.ToUniversalTime() : DateTime.MinValue;
-                        DateTime ds = DateTime.TryParse(sinceAt, out var st) ? st.ToUniversalTime() : DateTime.MinValue;
-                        int cmp = du.CompareTo(ds);
-                        if (cmp > 0 || (cmp == 0 && string.CompareOrdinal(s, sinceId) > 0))
-                        {
-                            all.Add(jo);
-                            kept++;
-                        }
+                        all.Add(jo);
+                        last = jo;
                     }
                 }
+                if (last != null)
+                {
+                    sinceAt = last.Value<string>("updated_at") ?? sinceAt;
+                    sinceId = last.Value<string>("sync_id") ?? sinceId;
+                }
                 if (arr.Count < PageSize) break;
-                from += PageSize;
-                if (kept == 0 && from > PageSize * 20) break; // safety
             }
             return all;
         }
@@ -954,7 +1035,6 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
-                EnsureChildBalanceMarker(con, syncId, r["Did"], 0, ToD(r["AmounGiven"]));
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_payouts", new
@@ -985,7 +1065,6 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["DealerId"]);
-                EnsureChildBalanceMarker(con, syncId, r["DealerId"], ToD(r["AddDisel"]) * ToD(r["Rate"]), 0);
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_purchases", new
@@ -1018,7 +1097,6 @@ END;";
                 string syncId = string.IsNullOrWhiteSpace(Convert.ToString(r["SyncId"])) ? Guid.NewGuid().ToString() : Convert.ToString(r["SyncId"]);
                 string updatedAt = RowUpdatedAt(r);
                 string dSync = GetSyncId(con, "AddDealer", "Did", r["Did"]);
-                EnsureChildBalanceMarker(con, syncId, r["Did"], ToD(r["AmounGiven"]), 0);
                 try
                 {
                     var ack = await UpsertAsync("zaib_dealer_direct", new

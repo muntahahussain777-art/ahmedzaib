@@ -185,6 +185,8 @@ class DealerBalanceApply {
   }
 
   /// Queue a cloud-synced balance op (manual dealer edit / closing / etc.).
+  /// When [sourceSyncId] is stable (e.g. opening:{dealerSync}), reuses the existing
+  /// op SyncId so retries do not invent a second cloud identity.
   static Future<void> enqueueOp({
     required DatabaseExecutor db,
     required String dealerSyncId,
@@ -195,41 +197,90 @@ class DealerBalanceApply {
     String? dateText,
     String? note,
     bool alreadyAppliedLocally = true,
+    int? dealerId,
   }) async {
     if (dealerSyncId.isEmpty) return;
     if (ddDelta == 0 && dDelta == 0) return;
-    final syncId = SyncMeta.newId();
-    final source = (sourceSyncId == null || sourceSyncId.isEmpty) ? syncId : sourceSyncId;
-    await db.insert('SyncDealerBalanceOp', {
-      'SyncId': syncId,
-      'DealerSyncId': dealerSyncId,
-      'DdDelta': ddDelta,
-      'DDelta': dDelta,
-      'SourceKind': sourceKind,
-      'SourceSyncId': source,
-      'DateText': dateText,
-      'Note': note,
-      'UpdatedAt': SyncMeta.nowIso(),
-      'SyncDirty': 1,
-      'DeletedAt': null,
-    });
-    if (alreadyAppliedLocally) {
-      final didRows = await db.query(
-        'AddDealer',
-        columns: ['Did'],
-        where: 'SyncId = ?',
-        whereArgs: [dealerSyncId],
+    final source = (sourceSyncId == null || sourceSyncId.isEmpty) ? null : sourceSyncId;
+    String syncId;
+    if (source != null) {
+      final existing = await db.query(
+        'SyncDealerBalanceOp',
+        columns: ['SyncId'],
+        where: 'SourceSyncId = ? AND DeletedAt IS NULL',
+        whereArgs: [source],
         limit: 1,
       );
-      final did = didRows.isEmpty
-          ? null
-          : (didRows.first['Did'] is int
-              ? didRows.first['Did'] as int
-              : int.tryParse('${didRows.first['Did']}'));
+      if (existing.isNotEmpty && (existing.first['SyncId']?.toString().isNotEmpty ?? false)) {
+        syncId = existing.first['SyncId']!.toString();
+        await db.update(
+          'SyncDealerBalanceOp',
+          {
+            'DealerSyncId': dealerSyncId,
+            'DdDelta': ddDelta,
+            'DDelta': dDelta,
+            'SourceKind': sourceKind,
+            'DateText': dateText,
+            'Note': note,
+            'UpdatedAt': SyncMeta.nowIso(),
+            'SyncDirty': 1,
+            'DeletedAt': null,
+          },
+          where: 'SyncId = ?',
+          whereArgs: [syncId],
+        );
+      } else {
+        syncId = SyncMeta.newId();
+        await db.insert('SyncDealerBalanceOp', {
+          'SyncId': syncId,
+          'DealerSyncId': dealerSyncId,
+          'DdDelta': ddDelta,
+          'DDelta': dDelta,
+          'SourceKind': sourceKind,
+          'SourceSyncId': source,
+          'DateText': dateText,
+          'Note': note,
+          'UpdatedAt': SyncMeta.nowIso(),
+          'SyncDirty': 1,
+          'DeletedAt': null,
+        });
+      }
+    } else {
+      syncId = SyncMeta.newId();
+      await db.insert('SyncDealerBalanceOp', {
+        'SyncId': syncId,
+        'DealerSyncId': dealerSyncId,
+        'DdDelta': ddDelta,
+        'DDelta': dDelta,
+        'SourceKind': sourceKind,
+        'SourceSyncId': syncId,
+        'DateText': dateText,
+        'Note': note,
+        'UpdatedAt': SyncMeta.nowIso(),
+        'SyncDirty': 1,
+        'DeletedAt': null,
+      });
+    }
+    final appliedKey = source ?? syncId;
+    if (alreadyAppliedLocally) {
+      int? did = dealerId;
+      if (did == null) {
+        final didRows = await db.query(
+          'AddDealer',
+          columns: ['Did'],
+          where: 'SyncId = ?',
+          whereArgs: [dealerSyncId],
+          limit: 1,
+        );
+        if (didRows.isNotEmpty) {
+          final v = didRows.first['Did'];
+          did = v is int ? v : int.tryParse('$v');
+        }
+      }
       await db.insert(
         'SyncBalanceApplied',
         {
-          'SourceSyncId': source,
+          'SourceSyncId': appliedKey,
           'DealerId': did,
           'DealerSyncId': dealerSyncId,
           'DdDelta': ddDelta,
@@ -239,21 +290,23 @@ class DealerBalanceApply {
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
     } else {
-      final didRows = await db.query(
-        'AddDealer',
-        columns: ['Did'],
-        where: 'SyncId = ?',
-        whereArgs: [dealerSyncId],
-        limit: 1,
-      );
-      final did = didRows.isEmpty
-          ? null
-          : (didRows.first['Did'] is int
-              ? didRows.first['Did'] as int
-              : int.tryParse('${didRows.first['Did']}'));
+      int? did = dealerId;
+      if (did == null) {
+        final didRows = await db.query(
+          'AddDealer',
+          columns: ['Did'],
+          where: 'SyncId = ?',
+          whereArgs: [dealerSyncId],
+          limit: 1,
+        );
+        if (didRows.isNotEmpty) {
+          final v = didRows.first['Did'];
+          did = v is int ? v : int.tryParse('$v');
+        }
+      }
       await reconcile(
         db: db,
-        sourceSyncId: source,
+        sourceSyncId: appliedKey,
         dealerId: did,
         dealerSyncId: dealerSyncId,
         ddDelta: ddDelta,

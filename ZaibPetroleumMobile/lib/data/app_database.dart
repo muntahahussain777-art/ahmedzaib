@@ -511,6 +511,7 @@ class AppDatabase {
         await DealerBalanceApply.enqueueOp(
           db: txn,
           dealerSyncId: dealerSync,
+          dealerId: id,
           ddDelta: d.ddAmount,
           dDelta: d.dAmount,
           sourceKind: 'opening',
@@ -541,6 +542,7 @@ class AppDatabase {
         await DealerBalanceApply.enqueueOp(
           db: txn,
           dealerSyncId: dealerSync,
+          dealerId: d.id,
           ddDelta: ddDelta,
           dDelta: dDelta,
           sourceKind: 'manual',

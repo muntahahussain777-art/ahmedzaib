@@ -108,76 +108,67 @@ namespace ZaibPetroleumService.Model
 
             decimal newDd = string.IsNullOrWhiteSpace(txtmobile.Text) ? 0 : Convert.ToDecimal(txtmobile.Text.Replace(",", ""));
             decimal newD = DAmount;
-            decimal oldDd = 0;
-            decimal oldD = 0;
-            string dealerSyncId = null;
-            if (id > 0)
+            string dateText = dateValue.ToString("yyyy-MM-dd");
+            int saveDid = id;
+            string qry = saveDid == 0
+                ? "INSERT INTO AddDealer (DealerName, DDAmount, DAmount, Date) VALUES (@name, @Amount, @DAmount, @date)"
+                : "UPDATE AddDealer SET DealerName = @name, DDAmount = @Amount, DAmount = @DAmount, Date = @date WHERE Did = @id";
+            var ht = new Hashtable
             {
-                string readQry = "SELECT DDAmount, DAmount, SyncId FROM AddDealer WHERE Did = @id";
-                Hashtable readHt = new Hashtable { { "@id", id } };
-                DataTable oldDt = MainClass.ExecuteSelectQuery(readQry, readHt);
-                if (oldDt.Rows.Count > 0)
+                { "@id", saveDid },
+                { "@name", txtname.Text },
+                { "@Amount", newDd },
+                { "@DAmount", newD },
+                { "@date", dateText }
+            };
+
+            bool ok = MainClass.RunInTransaction((conn, tx) =>
+            {
+                decimal oldDd = 0;
+                decimal oldD = 0;
+                if (saveDid > 0)
                 {
-                    oldDd = oldDt.Rows[0]["DDAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(oldDt.Rows[0]["DDAmount"]);
-                    oldD = oldDt.Rows[0]["DAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(oldDt.Rows[0]["DAmount"]);
-                    dealerSyncId = oldDt.Rows[0]["SyncId"]?.ToString();
+                    DataRow old = LocalPersistence.ReadRow("AddDealer", "Did", saveDid, conn, tx);
+                    if (old == null) return false;
+                    oldDd = old["DDAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(old["DDAmount"]);
+                    oldD = old["DAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(old["DAmount"]);
                 }
-            }
+                if (MainClass.ExecInTx(qry, ht, conn, tx) <= 0) return false;
+                int savedId = saveDid;
+                if (savedId == 0)
+                {
+                    object rid = LocalPersistence.Scalar("SELECT CAST(last_insert_rowid() AS INTEGER)", null, conn, tx);
+                    if (rid == null || rid == DBNull.Value) return false;
+                    savedId = Convert.ToInt32(rid);
+                }
+                DataRow dealer = LocalPersistence.ReadRow("AddDealer", "Did", savedId, conn, tx);
+                if (dealer == null) return false;
+                string dealerSyncId = dealer["SyncId"]?.ToString();
+                if (string.IsNullOrWhiteSpace(dealerSyncId)) return false;
 
-            // Prepare query for database
-            string qry = "";
-            if (id == 0)
-            {
-                qry = "INSERT INTO AddDealer (DealerName, DDAmount, DAmount, Date) VALUES (@name, @Amount, @DAmount, @date)";
-            }
-            else
-            {
-                qry = "UPDATE AddDealer SET DealerName = @name, DDAmount = @Amount, DAmount = @DAmount, Date = @date WHERE Did = @id";
-            }
-
-            Hashtable ht = new Hashtable
-    {
-        { "@id", id },
-        { "@name", txtname.Text },
-        { "@Amount", newDd },
-        { "@DAmount", newD },
-        { "@date", dateValue.ToString("yyyy-MM-dd") }
-    };
-
-            int savedId = id;
-            int r = MainClass.DataInsertUpdateDelete(qry, ht);
-            if (r > 0)
-            {
-                if (savedId > 0 && !string.IsNullOrWhiteSpace(dealerSyncId))
+                if (saveDid > 0)
                 {
                     double ddDelta = (double)(newDd - oldDd);
                     double dDelta = (double)(newD - oldD);
                     if (Math.Abs(ddDelta) > 1e-9 || Math.Abs(dDelta) > 1e-9)
                     {
-                        SupabaseSyncService.EnqueueManualDealerBalanceOp(
-                            savedId, dealerSyncId, ddDelta, dDelta, dateValue.ToString("yyyy-MM-dd"));
+                        if (!SupabaseSyncService.EnqueueDealerBalanceOpInTx(
+                                conn, tx, savedId, dealerSyncId, ddDelta, dDelta, dateText, "manual", null))
+                            return false;
                     }
                 }
-                else if (savedId == 0 && (Math.Abs((double)newDd) > 1e-9 || Math.Abs((double)newD) > 1e-9))
+                else if (Math.Abs((double)newDd) > 1e-9 || Math.Abs((double)newD) > 1e-9)
                 {
-                    string lookupQry = "SELECT Did, SyncId FROM AddDealer WHERE DealerName = @name AND Date = @date ORDER BY Did DESC LIMIT 1";
-                    Hashtable lookupHt = new Hashtable
-                    {
-                        { "@name", txtname.Text },
-                        { "@date", dateValue.ToString("yyyy-MM-dd") }
-                    };
-                    DataTable newDt = MainClass.ExecuteSelectQuery(lookupQry, lookupHt);
-                    if (newDt.Rows.Count > 0)
-                    {
-                        int newDid = Convert.ToInt32(newDt.Rows[0]["Did"]);
-                        string newSync = newDt.Rows[0]["SyncId"]?.ToString();
-                        if (!string.IsNullOrWhiteSpace(newSync))
-                        {
-                            SupabaseSyncService.EnqueueOpeningDealerBalanceOp(
-                                newDid, newSync, (double)newDd, (double)newD, dateValue.ToString("yyyy-MM-dd"));
-                        }
-                    }
+                    if (!SupabaseSyncService.EnqueueDealerBalanceOpInTx(
+                            conn, tx, savedId, dealerSyncId, (double)newDd, (double)newD, dateText,
+                            "opening", "opening:" + dealerSyncId))
+                        return false;
                 }
+                return true;
+            });
+
+            if (ok)
+            {
                 CustomeMessage customMessageBox = new CustomeMessage("Saved Successfully", "Save");
                 customMessageBox.ShowDialog();
                 MainClass.Enable_reset_keep_date(this, txtdate);

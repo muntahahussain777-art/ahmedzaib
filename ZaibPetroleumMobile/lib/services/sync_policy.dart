@@ -12,8 +12,23 @@
 ///   restore requires an intentional restore path (not a normal update).
 /// - Pull cursor is (updated_at, sync_id). Unresolved (dirty/parent-missing)
 ///   remotes are staged before the cursor advances past them.
+/// - Late-arriving offline rows with older updated_at than the checkpoint are NOT
+///   returned by timestamp/keyset pull. Clients must push dirty rows/tombstones
+///   first (push-before-pull); peers pull only rows after the watermark.
 class SyncPolicy {
   SyncPolicy._();
+
+  /// PostgREST filter for rows at/after the composite cursor.
+  /// Empty [syncId] → inclusive gte on updated_at (bootstrap). Otherwise strict
+  /// keyset: (updated_at, sync_id) > (updatedAt, syncId).
+  static String keysetFilter({required String updatedAt, required String syncId}) {
+    if (syncId.isEmpty) return 'updated_at=gte.$updatedAt';
+    return 'or=(and(updated_at.eq.$updatedAt,sync_id.gt.$syncId),updated_at.gt.$updatedAt)';
+  }
+
+  /// Page exhaustion from raw server page length — never from a client-filtered subset.
+  static bool serverPageHasMore({required int rawPageLength, required int pageSize}) =>
+      rawPageLength >= pageSize;
 
   static DateTime parseTs(dynamic v) {
     if (v == null) return DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);

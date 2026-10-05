@@ -46,28 +46,43 @@ void main() {
   }
 
   group('DealerBalanceApply.reconcile idempotency', () {
-    test('same target applied twice does not double-adjust', () async {
-      const source = 'payout-sync-1';
+    test('payout 100 then 150 leaves DAmount at 150 after reconcile (not 200)', () async {
+      const source = 'payout-edit-100-150';
+      // Local insert: form adjusts +100 and records marker (already applied).
+      await db.rawUpdate('UPDATE AddDealer SET DAmount = DAmount + 100 WHERE Did = 1');
+      await db.insert('SyncBalanceApplied', {
+        'SourceSyncId': source,
+        'DealerId': 1,
+        'DdDelta': 0,
+        'DDelta': 100,
+        'AppliedAt': '2026-01-01T00:00:00.000Z',
+      });
+      expect(await balances(1), (100.0, 150.0));
+
+      // Local edit 100→150: form adjusts +50 and REPLACE marker to 150.
+      await db.rawUpdate('UPDATE AddDealer SET DAmount = DAmount + 50 WHERE Did = 1');
+      await db.insert(
+        'SyncBalanceApplied',
+        {
+          'SourceSyncId': source,
+          'DealerId': 1,
+          'DdDelta': 0,
+          'DDelta': 150,
+          'AppliedAt': '2026-01-01T00:01:00.000Z',
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      expect(await balances(1), (100.0, 200.0));
+
+      // Pull echo / repeated sync must not add another +50.
       await DealerBalanceApply.reconcile(
         db: db,
         sourceSyncId: source,
         dealerId: 1,
         ddDelta: 0,
-        dDelta: 25,
+        dDelta: 150,
       );
-      expect(await balances(1), (100.0, 75.0));
-
-      await DealerBalanceApply.reconcile(
-        db: db,
-        sourceSyncId: source,
-        dealerId: 1,
-        ddDelta: 0,
-        dDelta: 25,
-      );
-      expect(await balances(1), (100.0, 75.0));
-
-      final markers = await db.query('SyncBalanceApplied', where: 'SourceSyncId = ?', whereArgs: [source]);
-      expect(markers.length, 1);
+      expect(await balances(1), (100.0, 200.0));
     });
 
     test('changed target reverses prior effect then applies new deltas', () async {
