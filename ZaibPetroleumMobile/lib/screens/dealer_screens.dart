@@ -6,6 +6,7 @@ import '../data/app_database.dart';
 import '../models/models.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -18,17 +19,19 @@ class DealerListScreen extends StatefulWidget {
   State<DealerListScreen> createState() => _DealerListScreenState();
 }
 
-class _DealerListScreenState extends State<DealerListScreen> {
+class _DealerListScreenState extends State<DealerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<Dealer> _items = [];
+  List<String> _nameSuggestions = [];
   DealerLedgerSummary? _totals;
   String? _matchedName;
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -37,18 +40,27 @@ class _DealerListScreenState extends State<DealerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
+    final allDealers = await AppDatabase.instance.getDealers();
     final rows = await AppDatabase.instance.getDealers(query: _search.text);
     final matched = await AppDatabase.instance.findDealerByExactName(_search.text);
     final byName = matched?.id == null ? null : await AppDatabase.instance.getDealerLedgerSummary(matched!.id!);
     final totals = byName ?? await AppDatabase.instance.getGlobalDealerLedger();
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _totals = totals;
       _matchedName = matched?.name;
+      _nameSuggestions = allDealers.map((d) => d.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
@@ -57,7 +69,7 @@ class _DealerListScreenState extends State<DealerListScreen> {
       context,
       MaterialPageRoute(builder: (_) => DealerFormScreen(dealer: item)),
     );
-    if (ok == true) _load();
+    if (ok == true) _load(showSpinner: true);
   }
 
   @override
@@ -81,13 +93,11 @@ class _DealerListScreenState extends State<DealerListScreen> {
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-            child: TextField(
+            child: VipSuggestSearchField(
               controller: _search,
-              onChanged: (_) => _load(),
-              decoration: const InputDecoration(
-                hintText: 'Search dealer',
-                prefixIcon: Icon(Icons.search, color: AppColors.gold),
-              ),
+              suggestions: _nameSuggestions,
+              hint: 'Dealer name type / suggest',
+              onQueryChanged: (_) => _load(showSpinner: false),
             ),
           ),
           Expanded(
@@ -107,7 +117,7 @@ class _DealerListScreenState extends State<DealerListScreen> {
                               if (!await confirmDelete(context, '${d.name} delete?')) return;
                               try {
                                 await AppDatabase.instance.deleteDealer(d.id!);
-                                _load();
+                                _load(showSpinner: true);
                               } catch (e) {
                                 if (!context.mounted) return;
                                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));

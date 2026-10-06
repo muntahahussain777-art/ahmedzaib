@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Globalization;
 using System.Linq;
 using System.Windows.Forms;
+using ZaibPetroleumService.Services;
 
 namespace ZaibPetroleumService.Model
 {
@@ -200,9 +201,37 @@ namespace ZaibPetroleumService.Model
             {
                 if (!isEdit)
                 {
-                    if (!InsertLedgerRecord(newDealerId, newAmountPaid, note, paymentDate))
+                    bool ok = MainClass.RunInTransaction((conn, tx) =>
+                    {
+                        string insertQuery = @"
+                    INSERT INTO DieselLedgerDebit (Did, AmounGiven, Date, Note) 
+                    VALUES (@dealerId, @amountPaid, @paymentDate, @note)";
+                        var ht = new Hashtable
+                        {
+                            { "@dealerId", newDealerId },
+                            { "@amountPaid", newAmountPaid },
+                            { "@paymentDate", paymentDate.ToString("yyyy-MM-dd") },
+                            { "@note", note }
+                        };
+                        if (MainClass.ExecInTx(insertQuery, ht, conn, tx) <= 0) return false;
+                        if (newDealerId > 0 && newAmountPaid != 0)
+                        {
+                            if (MainClass.ExecInTx(
+                                    "UPDATE AddDealer SET DDAmount = DDAmount + @amount WHERE Did = @dealerId",
+                                    new Hashtable { { "@dealerId", newDealerId }, { "@amount", newAmountPaid } },
+                                    conn, tx) <= 0)
+                                return false;
+                        }
+                        long lid = Convert.ToInt64(LocalPersistence.Scalar("SELECT last_insert_rowid()", null, conn, tx));
+                        SupabaseSyncService.RecordLocalChildBalanceEffect(conn, tx, "DieselLedgerDebit", "LedgerID", lid);
+                        return true;
+                    });
+                    if (!ok)
+                    {
+                        ErrorFormMessage err = new ErrorFormMessage("ڈیٹا محفوظ کرنے میں خرابی آئی۔", "ZAIB PETROLEUM SERVICE");
+                        err.ShowDialog();
                         return;
-                    AddDDAmount(newDealerId, newAmountPaid);
+                    }
 
                     CustomeMessage successMsg = new CustomeMessage("نیا ریکارڈ محفوظ ہوگیا اور ڈیلر کا بیلنس اپڈیٹ ہوگیا۔", "ZAIB PETROLEUM SERVICE");
                     successMsg.ShowDialog();
@@ -211,22 +240,64 @@ namespace ZaibPetroleumService.Model
                 }
                 else
                 {
-                    // VIP update: pehle sirf isi LedgerID row — phir DDAmount pe sirf difference (doosri jagah touch nahi)
-                    if (!UpdateLedgerRecord(LedgerID, newDealerId, newAmountPaid, note, paymentDate))
-                        return;
+                    bool ok = MainClass.RunInTransaction((conn, tx) =>
+                    {
+                        DataRow old = LocalPersistence.ReadRow("DieselLedgerDebit", "LedgerID", LedgerID, conn, tx);
+                        if (old == null) return false;
+                        int authOldDid = Convert.ToInt32(old["Did"]);
+                        decimal authOldAmt = Convert.ToDecimal(old["AmounGiven"]);
 
-                    if (_oldDid != newDealerId)
+                        string updateQuery = @"
+                    UPDATE DieselLedgerDebit
+                    SET Did = @newDealerId, AmounGiven = @newAmountPaid, Date = @paymentDate, Note = @note
+                    WHERE LedgerID = @LedgerID";
+                        var ht = new Hashtable
+                        {
+                            { "@newDealerId", newDealerId },
+                            { "@newAmountPaid", newAmountPaid },
+                            { "@paymentDate", paymentDate.ToString("yyyy-MM-dd") },
+                            { "@note", note },
+                            { "@LedgerID", LedgerID }
+                        };
+                        if (MainClass.ExecInTx(updateQuery, ht, conn, tx) <= 0) return false;
+
+                        if (authOldDid != newDealerId)
+                        {
+                            if (authOldDid > 0 && authOldAmt != 0 &&
+                                MainClass.ExecInTx(
+                                    "UPDATE AddDealer SET DDAmount = DDAmount - @amount WHERE Did = @dealerId",
+                                    new Hashtable { { "@dealerId", authOldDid }, { "@amount", authOldAmt } },
+                                    conn, tx) <= 0)
+                                return false;
+                            if (newDealerId > 0 && newAmountPaid != 0 &&
+                                MainClass.ExecInTx(
+                                    "UPDATE AddDealer SET DDAmount = DDAmount + @amount WHERE Did = @dealerId",
+                                    new Hashtable { { "@dealerId", newDealerId }, { "@amount", newAmountPaid } },
+                                    conn, tx) <= 0)
+                                return false;
+                        }
+                        else
+                        {
+                            decimal difference = newAmountPaid - authOldAmt;
+                            if (difference != 0 && newDealerId > 0)
+                            {
+                                string q = difference > 0
+                                    ? "UPDATE AddDealer SET DDAmount = DDAmount + @amount WHERE Did = @dealerId"
+                                    : "UPDATE AddDealer SET DDAmount = DDAmount - @amount WHERE Did = @dealerId";
+                                if (MainClass.ExecInTx(q,
+                                        new Hashtable { { "@dealerId", newDealerId }, { "@amount", Math.Abs(difference) } },
+                                        conn, tx) <= 0)
+                                    return false;
+                            }
+                        }
+                        SupabaseSyncService.RecordLocalChildBalanceEffect(conn, tx, "DieselLedgerDebit", "LedgerID", LedgerID);
+                        return true;
+                    });
+                    if (!ok)
                     {
-                        SubtractDDAmount(_oldDid, _oldAmountPaid);
-                        AddDDAmount(newDealerId, newAmountPaid);
-                    }
-                    else
-                    {
-                        decimal difference = newAmountPaid - _oldAmountPaid;
-                        if (difference > 0)
-                            AddDDAmount(newDealerId, difference);
-                        else if (difference < 0)
-                            SubtractDDAmount(newDealerId, Math.Abs(difference));
+                        ErrorFormMessage err = new ErrorFormMessage("ڈیٹا اپڈیٹ کرنے میں خرابی آئی۔", "ZAIB PETROLEUM SERVICE");
+                        err.ShowDialog();
+                        return;
                     }
 
                     CustomeMessage successMsg = new CustomeMessage("ریکارڈ کامیابی سے اپڈیٹ ہوگیا۔", "ZAIB PETROLEUM SERVICE");
@@ -387,50 +458,58 @@ namespace ZaibPetroleumService.Model
         {
             if (LedgerID > 0)
             {
-                string selectQuery = "SELECT Did, AmounGiven FROM DieselLedgerDebit WHERE LedgerID = @LedgerID";
-                Hashtable selectParams = new Hashtable();
-                selectParams.Add("@LedgerID", LedgerID);
-
-                DataTable dt = MainClass.ExecuteSelectQuery(selectQuery, selectParams);
-                if (dt != null && dt.Rows.Count > 0)
+                YesOrNoMessage confirmDelete = new YesOrNoMessage(
+                    "کیا آپ واقعی اس ریکارڈ کو حذف کرنا چاہتے ہیں؟", "حذف کی تصدیق کریں");
+                if (confirmDelete.ShowDialog() == DialogResult.Yes)
                 {
-                    string dealerId = dt.Rows[0]["Did"].ToString();
-                    decimal amountToDelete = Convert.ToDecimal(dt.Rows[0]["AmounGiven"]);
-
-                    YesOrNoMessage confirmDelete = new YesOrNoMessage(
-                        "کیا آپ واقعی اس ریکارڈ کو حذف کرنا چاہتے ہیں؟", "حذف کی تصدیق کریں");
-                    if (confirmDelete.ShowDialog() == DialogResult.Yes)
+                    bool ok = MainClass.RunInTransaction((conn, tx) =>
                     {
-                        string deleteQuery = "DELETE FROM DieselLedgerDebit WHERE LedgerID = @LedgerID";
-                        Hashtable deleteParams = new Hashtable();
-                        deleteParams.Add("@LedgerID", LedgerID);
-
-                        int deleteResult = MainClass.DataInsertUpdateDelete(deleteQuery, deleteParams);
-                        if (deleteResult > 0)
+                        DataRow old = LocalPersistence.ReadRow("DieselLedgerDebit", "LedgerID", LedgerID, conn, tx);
+                        if (old == null) return false;
+                        int dealerId = Convert.ToInt32(old["Did"]);
+                        decimal amountToDelete = Convert.ToDecimal(old["AmounGiven"]);
+                        string syncId = old.Table.Columns.Contains("SyncId") ? old["SyncId"]?.ToString() : null;
+                        long? expectedRev = null;
+                        if (old.Table.Columns.Contains("ServerRev") && old["ServerRev"] != DBNull.Value)
                         {
-                            // Ab Dealer se DDAmount kam karo
-                            SubtractDDAmount(Convert.ToInt32(dealerId), amountToDelete);
+                            try { long v = Convert.ToInt64(old["ServerRev"]); if (v > 0) expectedRev = v; } catch { }
+                        }
 
-                            CustomeMessage successMessage = new CustomeMessage(
-                                "ریکارڈ کامیابی کے ساتھ حذف کر دیا گیا اور ڈیلر کا DDAmount اپ ڈیٹ ہو گیا۔",
-                                "ZAIB PETROLEUM SERVICE");
-                            successMessage.ShowDialog();
-                            this.DialogResult = DialogResult.OK;
-                            this.Close();
-                        }
-                        else
+                        if (MainClass.ExecInTx(
+                                "DELETE FROM DieselLedgerDebit WHERE LedgerID = @LedgerID",
+                                new Hashtable { { "@LedgerID", LedgerID } },
+                                conn, tx) <= 0)
+                            return false;
+
+                        LocalPersistence.EnsureTombstone(syncId, "zaib_dealer_direct", conn, tx, expectedRev);
+
+                        if (dealerId > 0 && amountToDelete != 0)
                         {
-                            ErrorFormMessage errorMessage = new ErrorFormMessage(
-                                "ڈیزل لیجر سے ریکارڈ ختم کرنے میں خرابی آئی۔", "ZAIB PETROLEUM SERVICE");
-                            errorMessage.ShowDialog();
+                            if (MainClass.ExecInTx(
+                                    "UPDATE AddDealer SET DDAmount = DDAmount - @amount WHERE Did = @dealerId",
+                                    new Hashtable { { "@dealerId", dealerId }, { "@amount", amountToDelete } },
+                                    conn, tx) <= 0)
+                                return false;
                         }
+                        SupabaseSyncService.DeleteBalanceMarkerOnly(conn, tx, syncId);
+                        return true;
+                    });
+
+                    if (ok)
+                    {
+                        CustomeMessage successMessage = new CustomeMessage(
+                            "ریکارڈ کامیابی کے ساتھ حذف کر دیا گیا اور ڈیلر کا DDAmount اپ ڈیٹ ہو گیا۔",
+                            "ZAIB PETROLEUM SERVICE");
+                        successMessage.ShowDialog();
+                        this.DialogResult = DialogResult.OK;
+                        this.Close();
                     }
-                }
-                else
-                {
-                    ErrorFormMessage errorMessage = new ErrorFormMessage(
-                        "ڈیلر کا ID اور رقم حاصل کرنے میں خرابی آئی حذف کرنے سے پہلے۔", "ZAIB PETROLEUM SERVICE");
-                    errorMessage.ShowDialog();
+                    else
+                    {
+                        ErrorFormMessage errorMessage = new ErrorFormMessage(
+                            "ڈیزل لیجر سے ریکارڈ ختم کرنے میں خرابی آئی۔", "ZAIB PETROLEUM SERVICE");
+                        errorMessage.ShowDialog();
+                    }
                 }
             }
             else

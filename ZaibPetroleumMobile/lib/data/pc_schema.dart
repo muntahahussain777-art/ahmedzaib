@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:sqflite/sqflite.dart';
 
 /// Exact PC-compatible SQLite schema (DiselPetrolPump.db tables).
@@ -115,6 +117,19 @@ class PcSchema {
         Note TEXT
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS DealertoDealer (
+        LedgerID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Date TEXT,
+        FirstDealer INTEGER,
+        SecondDealer INTEGER,
+        AmounGiven REAL,
+        Note TEXT,
+        id INTEGER,
+        Did INTEGER
+      )
+    ''');
   }
 
   static Future<void> ensure(Database db) async {
@@ -138,11 +153,13 @@ class PcSchema {
       'StockDiesel',
       'BankTransactions',
       'Expensetable',
+      'DealertoDealer',
     ];
     for (final t in syncTables) {
       await _ensureColumn(db, t, 'SyncId', 'TEXT');
       await _ensureColumn(db, t, 'UpdatedAt', 'TEXT');
       await _ensureColumn(db, t, 'SyncDirty', 'INTEGER DEFAULT 1');
+      await _ensureColumn(db, t, 'ServerRev', 'INTEGER');
       try {
         await db.execute(
           'CREATE UNIQUE INDEX IF NOT EXISTS uq_${t}_SyncId ON $t(SyncId) WHERE SyncId IS NOT NULL AND SyncId <> \'\'',
@@ -156,7 +173,66 @@ class PcSchema {
       CREATE TABLE IF NOT EXISTS SyncTombstone (
         SyncId TEXT PRIMARY KEY,
         CloudTable TEXT NOT NULL,
-        DeletedAt TEXT NOT NULL
+        DeletedAt TEXT NOT NULL,
+        ExpectedServerRev INTEGER,
+        RequestId TEXT
+      )
+    ''');
+    await _ensureColumn(db, 'SyncTombstone', 'ExpectedServerRev', 'INTEGER');
+    await _ensureColumn(db, 'SyncTombstone', 'RequestId', 'TEXT');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncFailLog (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        At TEXT NOT NULL,
+        Scope TEXT NOT NULL,
+        SyncId TEXT,
+        Message TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncStagedRemote (
+        SyncId TEXT NOT NULL,
+        CloudTable TEXT NOT NULL,
+        PayloadJson TEXT NOT NULL,
+        UpdatedAt TEXT NOT NULL,
+        PRIMARY KEY (CloudTable, SyncId)
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncRejectedUpload (
+        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+        At TEXT NOT NULL,
+        CloudTable TEXT NOT NULL,
+        SyncId TEXT NOT NULL,
+        LocalUpdatedAt TEXT,
+        PayloadJson TEXT NOT NULL,
+        ServerPayloadJson TEXT,
+        Outcome TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncBalanceApplied (
+        SourceSyncId TEXT PRIMARY KEY,
+        DealerId INTEGER,
+        DealerSyncId TEXT,
+        DdDelta REAL NOT NULL DEFAULT 0,
+        DDelta REAL NOT NULL DEFAULT 0,
+        AppliedAt TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS SyncDealerBalanceOp (
+        SyncId TEXT PRIMARY KEY,
+        DealerSyncId TEXT NOT NULL,
+        DdDelta REAL NOT NULL DEFAULT 0,
+        DDelta REAL NOT NULL DEFAULT 0,
+        SourceKind TEXT NOT NULL DEFAULT 'manual',
+        SourceSyncId TEXT,
+        DateText TEXT,
+        Note TEXT,
+        UpdatedAt TEXT NOT NULL,
+        SyncDirty INTEGER NOT NULL DEFAULT 1,
+        DeletedAt TEXT
       )
     ''');
 
@@ -189,7 +265,35 @@ class PcSchema {
     final info = await db.rawQuery('PRAGMA table_info($table)');
     final exists = info.any((r) => (r['name']?.toString() ?? '') == column);
     if (!exists) {
+      if (table == 'SyncTombstone' &&
+          (column == 'ExpectedServerRev' || column == 'RequestId')) {
+        await _tryBackupBeforeMigration(db);
+      }
       await db.execute('ALTER TABLE $table ADD COLUMN $column $typeSql');
+    }
+  }
+
+  /// Copy live DB + WAL/SHM before additive SyncTombstone migration.
+  static Future<void> _tryBackupBeforeMigration(Database db) async {
+    try {
+      final path = db.path;
+      if (path.isEmpty) return;
+      final stamp = DateTime.now()
+          .toUtc()
+          .toIso8601String()
+          .replaceAll(':', '')
+          .replaceAll('.', '')
+          .replaceAll('-', '');
+      final dest = '$path.pre_tombstone_rev_$stamp.bak';
+      await File(path).copy(dest);
+      for (final suffix in ['-wal', '-shm']) {
+        final side = File('$path$suffix');
+        if (await side.exists()) {
+          await side.copy('$dest$suffix');
+        }
+      }
+    } catch (_) {
+      // Never block open on backup failure.
     }
   }
 }

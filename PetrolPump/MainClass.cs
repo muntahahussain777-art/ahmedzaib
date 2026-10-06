@@ -221,23 +221,59 @@ namespace ZaibPetroleumService
             int res = 0;
             try
             {
-                SQLiteCommand cmd = new SQLiteCommand(qry, con);
-                cmd.CommandType = CommandType.Text;
-                foreach (DictionaryEntry item in ht)
+                // Dedicated connection — shared `con` races / half-open state avoid
+                using (var connection = new SQLiteConnection(con_string))
                 {
-                    cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value);
+                    connection.Open();
+                    using (var cmd = new SQLiteCommand(qry, connection))
+                    {
+                        cmd.CommandType = CommandType.Text;
+                        if (ht != null)
+                        {
+                            foreach (DictionaryEntry item in ht)
+                                cmd.Parameters.AddWithValue(item.Key.ToString(), item.Value ?? DBNull.Value);
+                        }
+                        res = cmd.ExecuteNonQuery();
+                    }
                 }
-                con.Open();
-                res = cmd.ExecuteNonQuery();
-                con.Close();
                 AuditTrailService.TryLog(qry, ht, res);
             }
             catch (Exception ex)
             {
-                con.Close();
+                try { if (con.State == ConnectionState.Open) con.Close(); } catch { /* ignore */ }
                 MessageBox.Show(ex.Message);
+                res = 0;
             }
             return res;
+        }
+
+        /// <summary>
+        /// Part 1: multi-statement local write (entry + balance + tombstone) in one commit.
+        /// </summary>
+        public static bool RunInTransaction(Func<SQLiteConnection, SQLiteTransaction, bool> work)
+        {
+            return LocalPersistence.RunInTransaction(work);
+        }
+
+        public static int ExecInTx(string qry, Hashtable ht, SQLiteConnection connection, SQLiteTransaction tx)
+        {
+            return LocalPersistence.Exec(qry, ht, connection, tx);
+        }
+
+        /// <summary>
+        /// Part 3: delete synced row + SyncTombstone so cloud pull cannot resurrect.
+        /// </summary>
+        public static int DeleteWithTombstone(string table, string pkCol, object pk, string cloudTable)
+        {
+            return LocalPersistence.DeleteByPkWithTombstone(table, pkCol, pk, cloudTable);
+        }
+
+        /// <summary>
+        /// Part 3: bulk/side delete with per-row SyncTombstone.
+        /// </summary>
+        public static int DeleteMatchingWithTombstones(string table, string whereSql, Hashtable ht, string cloudTable)
+        {
+            return LocalPersistence.DeleteMatchingWithTombstones(table, whereSql, ht, cloudTable);
         }
         public static void Enable_reset(Form p)
         {

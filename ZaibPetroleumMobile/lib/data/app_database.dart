@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../models/models.dart';
+import '../services/dealer_balance_apply.dart';
 import '../services/sync_meta.dart';
 import 'pc_schema.dart';
 
@@ -133,38 +134,109 @@ class AppDatabase {
     _syncBackfillDone = true;
   }
 
-  Future<void> _tombstone(String cloudTable, String? syncId) async {
+  Future<void> _tombstone(
+    String cloudTable,
+    String? syncId, {
+    int? expectedServerRev,
+    DatabaseExecutor? executor,
+  }) async {
     if (syncId == null || syncId.isEmpty) return;
-    final db = await database;
+    final db = executor ?? await database;
+    final deletedAt = SyncMeta.nowIso();
+    final reqId = SyncMeta.tombstoneRequestId(cloudTable, syncId, deletedAt);
     await db.insert(
       'SyncTombstone',
-      {'SyncId': syncId, 'CloudTable': cloudTable, 'DeletedAt': SyncMeta.nowIso()},
+      {
+        'SyncId': syncId,
+        'CloudTable': cloudTable,
+        'DeletedAt': deletedAt,
+        'ExpectedServerRev': expectedServerRev,
+        'RequestId': reqId,
+      },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
-    SyncMeta.markChanged();
   }
 
-  Future<String?> _readSyncId(String table, String pkCol, Object id) async {
-    final db = await database;
+  Future<({String? syncId, int? serverRev})> _readSyncMeta(
+    String table,
+    String pkCol,
+    Object id, [
+    DatabaseExecutor? executor,
+  ]) async {
+    final db = executor ?? await database;
+    final rows = await db.query(
+      table,
+      columns: ['SyncId', 'ServerRev'],
+      where: '$pkCol = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (rows.isEmpty) return (syncId: null, serverRev: null);
+    return (
+      syncId: rows.first['SyncId']?.toString(),
+      serverRev: SyncMeta.asServerRev(rows.first['ServerRev']),
+    );
+  }
+
+  Future<String?> _readSyncId(String table, String pkCol, Object id, [DatabaseExecutor? executor]) async {
+    final db = executor ?? await database;
     final rows = await db.query(table, columns: ['SyncId'], where: '$pkCol = ?', whereArgs: [id], limit: 1);
     if (rows.isEmpty) return null;
     return rows.first['SyncId']?.toString();
   }
 
-  Future<int> _insertAndNotify(String table, Map<String, Object?> map) async {
+  Future<Map<String, Object?>?> _readRow(String table, String pkCol, Object id, DatabaseExecutor db) async {
+    final rows = await db.query(table, where: '$pkCol = ?', whereArgs: [id], limit: 1);
+    if (rows.isEmpty) return null;
+    return Map<String, Object?>.from(rows.first);
+  }
+
+  /// Entry + balance + tombstone in ONE transaction. Sync queue only after commit.
+  Future<T> _runLocalWrite<T>(Future<T> Function(Transaction txn) work) async {
     final db = await database;
-    SyncMeta.stampNew(map);
-    final id = await db.insert(table, map);
+    late T result;
+    await db.transaction((txn) async {
+      result = await work(txn);
+    });
     SyncMeta.markChanged();
-    return id;
+    return result;
+  }
+
+  Future<int> _insertAndNotify(String table, Map<String, Object?> map) async {
+    return _runLocalWrite((txn) async {
+      SyncMeta.stampNew(map);
+      final id = await txn.insert(table, map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      return id;
+    });
   }
 
   Future<int> _updateAndNotify(String table, Map<String, Object?> map, String where, List<Object?> args) async {
-    final db = await database;
-    SyncMeta.stampUpdate(map);
-    final n = await db.update(table, map, where: where, whereArgs: args);
-    SyncMeta.markChanged();
-    return n;
+    return _runLocalWrite((txn) async {
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update(table, map, where: where, whereArgs: args);
+      if (n <= 0) throw Exception('Update fail — record nahi mili.');
+      return n;
+    });
+  }
+
+  /// Child-driven aggregates stay local; do not SyncDirty dealer (avoids absolute LWW wipe).
+  Future<void> _reconcileChildBalance(
+    DatabaseExecutor db, {
+    required String sourceSyncId,
+    required int dealerId,
+    required double ddDelta,
+    required double dDelta,
+  }) async {
+    await DealerBalanceApply.reconcile(
+      db: db,
+      sourceSyncId: sourceSyncId,
+      dealerId: dealerId,
+      dealerSyncId: await DealerBalanceApply.dealerSyncId(db, dealerId),
+      ddDelta: ddDelta,
+      dDelta: dDelta,
+      markDealerDirty: false,
+    );
   }
 
   // ---------- Customers (AddCustomer) ----------
@@ -181,12 +253,16 @@ class AppDatabase {
   }
 
   Future<int> deleteCustomer(int id) async {
-    final db = await database;
-    final used = (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM PetrolAdd WHERE CustomerId = ?', [id])) ?? 0) +
-        (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE CustomerId = ?', [id])) ?? 0);
-    if (used > 0) throw Exception('Ye customer use ho raha hai — delete nahi ho sakta.');
-    await _tombstone('zaib_customers', await _readSyncId('AddCustomer', 'id', id));
-    return db.delete('AddCustomer', where: 'id = ?', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final used = (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM PetrolAdd WHERE CustomerId = ?', [id])) ?? 0) +
+          (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE CustomerId = ?', [id])) ?? 0);
+      if (used > 0) throw Exception('Ye customer use ho raha hai — delete nahi ho sakta.');
+      final meta = await _readSyncMeta('AddCustomer', 'id', id, txn);
+      await _tombstone('zaib_customers', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('AddCustomer', where: 'id = ?', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<Customer>> getCustomers({String query = ''}) async {
@@ -200,12 +276,37 @@ class AppDatabase {
 
   Future<CustomerLedgerSummary> getCustomerLedgerSummary(int customerId) async {
     final db = await database;
+    // Match WinForms VIP: Amount jama / Credit minus (Sale + Credit rows).
     final inRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0) + IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE CustomerId = ?',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN 0
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE CustomerId = ?
+      ''',
       [customerId],
     );
     final creditRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Credit,0)),0) AS t FROM PetrolAdd WHERE CustomerId = ?',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN
+            CASE
+              WHEN IFNULL(Credit, 0) <> 0 THEN IFNULL(Credit, 0)
+              ELSE IFNULL(Amount, 0) + IFNULL(Advance, 0)
+            END
+          ELSE IFNULL(Credit, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE CustomerId = ?
+      ''',
       [customerId],
     );
     final totalAmount = asDouble(inRow.first['t']);
@@ -296,9 +397,13 @@ class AppDatabase {
   }
 
   Future<int> deleteSale(int id) async {
-    final db = await database;
-    await _tombstone('zaib_petrol_entries', await _readSyncId('PetrolAdd', 'pid', id));
-    return db.delete('PetrolAdd', where: 'pid = ?', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final meta = await _readSyncMeta('PetrolAdd', 'pid', id, txn);
+      await _tombstone('zaib_petrol_entries', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('PetrolAdd', where: 'pid = ?', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<DieselSale>> getSales({String query = '', String? from, String? to}) async {
@@ -311,8 +416,13 @@ class AppDatabase {
       LEFT JOIN AddCustomer c ON c.id = s.CustomerId
       WHERE IFNULL(s.IsInitialEntry, 1) = 1
     ''');
-    if (q.isNotEmpty) {
-      buf.write(' AND (c.Name LIKE ? OR IFNULL(s.vehicle,\'\') LIKE ? OR IFNULL(s.ReceiptNo,\'\') LIKE ?)');
+    // WinForms VIP search: exact customer name → CustomerId only (no partial mix).
+    final exact = q.isEmpty ? null : await findCustomerByExactName(q);
+    if (exact?.id != null) {
+      buf.write(' AND s.CustomerId = ?');
+      args.add(exact!.id);
+    } else if (q.isNotEmpty) {
+      buf.write(' AND (IFNULL(s.vehicle,\'\') LIKE ? OR IFNULL(s.ReceiptNo,\'\') LIKE ? OR IFNULL(s.Note,\'\') LIKE ?)');
       args.addAll(['%$q%', '%$q%', '%$q%']);
     }
     if (from != null && from.isNotEmpty) {
@@ -342,48 +452,155 @@ class AppDatabase {
   }
 
   Future<int> deleteCredit(int id) async {
-    final db = await database;
-    await _tombstone('zaib_petrol_entries', await _readSyncId('PetrolAdd', 'pid', id));
-    return db.delete('PetrolAdd', where: 'pid = ? AND IFNULL(IsInitialEntry,0) = 0', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final meta = await _readSyncMeta('PetrolAdd', 'pid', id, txn);
+      await _tombstone('zaib_petrol_entries', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('PetrolAdd', where: 'pid = ? AND IFNULL(IsInitialEntry,0) = 0', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<CreditCustomerEntry>> getCredits({String query = ''}) async {
     final db = await database;
     final q = query.trim();
-    final rows = await db.rawQuery('''
-      SELECT e.*, c.Name AS customer_name
+    final exact = q.isEmpty ? null : await findCustomerByExactName(q);
+    final args = <Object?>[];
+    final buf = StringBuffer('''
+      SELECT e.*, c.Name AS customer_name,
+        CASE
+          WHEN IFNULL(e.Credit, 0) <> 0 THEN IFNULL(e.Credit, 0)
+          ELSE IFNULL(e.Amount, 0) + IFNULL(e.Advance, 0)
+        END AS Credit
       FROM PetrolAdd e
       LEFT JOIN AddCustomer c ON c.id = e.CustomerId
       WHERE IFNULL(e.IsInitialEntry, 1) = 0
-      ${q.isEmpty ? '' : 'AND (c.Name LIKE ? OR IFNULL(e.ReceiptNo,\'\') LIKE ?)'}
-      ORDER BY e.pid DESC
-    ''', q.isEmpty ? null : ['%$q%', '%$q%']);
+    ''');
+    if (exact?.id != null) {
+      buf.write(' AND e.CustomerId = ?');
+      args.add(exact!.id);
+    } else if (q.isNotEmpty) {
+      buf.write(' AND (IFNULL(e.ReceiptNo,\'\') LIKE ? OR IFNULL(e.Note,\'\') LIKE ?)');
+      args.addAll(['%$q%', '%$q%']);
+    }
+    buf.write(' ORDER BY e.pid DESC');
+    final rows = await db.rawQuery(buf.toString(), args.isEmpty ? null : args);
     return rows.map(CreditCustomerEntry.fromMap).toList();
+  }
+
+  /// Read-only: groups PetrolAdd rows that share business values but different SyncIds.
+  /// Does NOT delete — identical values may be legitimate distinct sales.
+  Future<List<Map<String, Object?>>> listSuspectedDuplicatePetrolEntries() async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT pid, SyncId, IFNULL(SyncDirty, 0) AS SyncDirty, UpdatedAt,
+             CustomerId, Date,
+             IFNULL(Amount, 0) AS Amount, IFNULL(Credit, 0) AS Credit,
+             IFNULL(IsInitialEntry, 1) AS IsInitialEntry,
+             IFNULL(Advance, 0) AS Advance, IFNULL(Litter, 0) AS Litter, IFNULL(Rate, 0) AS Rate,
+             IFNULL(ReceiptNo, '') AS ReceiptNo, IFNULL(vehicle, '') AS vehicle
+      FROM PetrolAdd
+      ORDER BY CustomerId, Date, Amount, Credit, IsInitialEntry, Advance, Litter, Rate, ReceiptNo, vehicle,
+               UpdatedAt DESC, pid DESC
+    ''');
+    final byKey = <String, List<Map<String, Object?>>>{};
+    for (final r in rows) {
+      final key =
+          '${r['CustomerId']}|${r['Date']}|${r['Amount']}|${r['Credit']}|${r['IsInitialEntry']}|${r['Advance']}|${r['Litter']}|${r['Rate']}|${r['ReceiptNo']}|${r['vehicle']}';
+      byKey.putIfAbsent(key, () => []).add(r);
+    }
+    final suspected = <Map<String, Object?>>[];
+    for (final e in byKey.entries) {
+      final group = e.value;
+      if (group.length < 2) continue;
+      final syncIds = group.map((r) => '${r['SyncId'] ?? ''}').where((s) => s.isNotEmpty).toSet();
+      if (syncIds.length < 2) continue; // same SyncId = not distinct
+      for (final r in group) {
+        suspected.add({
+          ...r,
+          'fingerprint': e.key,
+          'groupSize': group.length,
+        });
+      }
+    }
+    return suspected;
+  }
+
+  /// @deprecated Automatic fingerprint deletion removed — use [listSuspectedDuplicatePetrolEntries].
+  @Deprecated('Do not auto-delete by value fingerprint; SyncId is identity')
+  Future<int> purgeDuplicatePetrolEntries() async {
+    // No-op: preserve distinct SyncIds. Callers should use listSuspectedDuplicatePetrolEntries.
+    return 0;
   }
 
   // ---------- Dealers (AddDealer) ----------
   Future<int> insertDealer(Dealer d) async {
-    final map = d.toMap()..remove('Did');
-    return _insertAndNotify('AddDealer', map);
+    return _runLocalWrite((txn) async {
+      final map = d.toMap()..remove('Did');
+      SyncMeta.stampNew(map);
+      final id = await txn.insert('AddDealer', map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      final dealerSync = map['SyncId']?.toString() ?? '';
+      if (dealerSync.isNotEmpty && (d.ddAmount != 0 || d.dAmount != 0)) {
+        await DealerBalanceApply.enqueueOp(
+          db: txn,
+          dealerSyncId: dealerSync,
+          dealerId: id,
+          ddDelta: d.ddAmount,
+          dDelta: d.dAmount,
+          sourceKind: 'opening',
+          sourceSyncId: 'opening:$dealerSync',
+          alreadyAppliedLocally: true,
+        );
+      }
+      return id;
+    });
   }
 
   Future<int> updateDealer(Dealer d) async {
-    final map = d.toMap()..remove('Did');
-    final existing = await _readSyncId('AddDealer', 'Did', d.id!);
-    if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
-    return _updateAndNotify('AddDealer', map, 'Did = ?', [d.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('AddDealer', 'Did', d.id!, txn);
+      if (auth == null) throw Exception('Update fail — record nahi mili.');
+      final oldDd = asDouble(auth['DDAmount']);
+      final oldD = asDouble(auth['DAmount']);
+      final ddDelta = d.ddAmount - oldDd;
+      final dDelta = d.dAmount - oldD;
+      final map = d.toMap()..remove('Did');
+      final existing = auth['SyncId']?.toString();
+      if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update('AddDealer', map, where: 'Did = ?', whereArgs: [d.id]);
+      if (n <= 0) throw Exception('Update fail — record nahi mili.');
+      final dealerSync = map['SyncId']?.toString() ?? '';
+      if (dealerSync.isNotEmpty && (ddDelta != 0 || dDelta != 0)) {
+        await DealerBalanceApply.enqueueOp(
+          db: txn,
+          dealerSyncId: dealerSync,
+          dealerId: d.id,
+          ddDelta: ddDelta,
+          dDelta: dDelta,
+          sourceKind: 'manual',
+          alreadyAppliedLocally: true,
+        );
+      }
+      return n;
+    });
   }
 
   Future<int> deleteDealer(int id) async {
-    final db = await database;
-    final used = (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM DieselLedgerCredit WHERE Did = ?', [id])) ?? 0) +
-        (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM DieselLedgerDebit WHERE Did = ?', [id])) ?? 0) +
-        (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM AddStock WHERE DealerId = ?', [id])) ?? 0) +
-        (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM StockDiesel WHERE SDid = ?', [id])) ?? 0) +
-        (Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE DealerId = ?', [id])) ?? 0);
-    if (used > 0) throw Exception('Ye dealer use ho raha hai — delete nahi ho sakta.');
-    await _tombstone('zaib_dealers', await _readSyncId('AddDealer', 'Did', id));
-    return db.delete('AddDealer', where: 'Did = ?', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final used = (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM DieselLedgerCredit WHERE Did = ?', [id])) ?? 0) +
+          (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM DieselLedgerDebit WHERE Did = ?', [id])) ?? 0) +
+          (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM AddStock WHERE DealerId = ?', [id])) ?? 0) +
+          (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM StockDiesel WHERE SDid = ?', [id])) ?? 0) +
+          (Sqflite.firstIntValue(await txn.rawQuery('SELECT COUNT(*) FROM BankTransactions WHERE DealerId = ?', [id])) ?? 0);
+      if (used > 0) throw Exception('Ye dealer use ho raha hai — delete nahi ho sakta.');
+      final meta = await _readSyncMeta('AddDealer', 'Did', id, txn);
+      await _tombstone('zaib_dealers', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('AddDealer', where: 'Did = ?', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<Dealer>> getDealers({String query = ''}) async {
@@ -421,46 +638,60 @@ class AppDatabase {
     return Dealer(id: id, name: 'Stock', ddAmount: 0, dAmount: 0, date: map['Date'] as String);
   }
 
-  Future<void> _adjustDAmount(int dealerId, double delta) async {
-    final db = await database;
-    await db.rawUpdate(
-      'UPDATE AddDealer SET DAmount = IFNULL(DAmount,0) + ?, UpdatedAt = ?, SyncDirty = 1 WHERE Did = ?',
-      [delta, SyncMeta.nowIso(), dealerId],
-    );
-    SyncMeta.markChanged();
-  }
-
-  Future<void> _adjustDdAmount(int dealerId, double delta) async {
-    final db = await database;
-    await db.rawUpdate(
-      'UPDATE AddDealer SET DDAmount = IFNULL(DDAmount,0) + ?, UpdatedAt = ?, SyncDirty = 1 WHERE Did = ?',
-      [delta, SyncMeta.nowIso(), dealerId],
-    );
-    SyncMeta.markChanged();
-  }
-
   // ---------- Dealer Payout (DieselLedgerCredit) ----------
   Future<int> insertPayout(DealerPayout p) async {
-    final map = p.toMap()..remove('LedgerID');
-    final id = await _insertAndNotify('DieselLedgerCredit', map);
-    await _adjustDAmount(p.dealerId, p.amountGiven);
-    return id;
+    return _runLocalWrite((txn) async {
+      final map = p.toMap()..remove('LedgerID');
+      SyncMeta.stampNew(map);
+      final id = await txn.insert('DieselLedgerCredit', map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: p.dealerId,
+        ddDelta: 0,
+        dDelta: p.amountGiven,
+      );
+      return id;
+    });
   }
 
   Future<int> updatePayout(DealerPayout oldP, DealerPayout p) async {
-    await _adjustDAmount(oldP.dealerId, -oldP.amountGiven);
-    await _adjustDAmount(p.dealerId, p.amountGiven);
-    final map = p.toMap()..remove('LedgerID');
-    final existing = await _readSyncId('DieselLedgerCredit', 'LedgerID', p.id!);
-    if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
-    return _updateAndNotify('DieselLedgerCredit', map, 'LedgerID = ?', [p.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('DieselLedgerCredit', 'LedgerID', p.id!, txn);
+      if (auth == null) throw Exception('Update fail — record nahi mili.');
+      final map = p.toMap()..remove('LedgerID');
+      final existing = auth['SyncId']?.toString();
+      if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update('DieselLedgerCredit', map, where: 'LedgerID = ?', whereArgs: [p.id]);
+      if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: p.dealerId,
+        ddDelta: 0,
+        dDelta: p.amountGiven,
+      );
+      return n;
+    });
   }
 
   Future<int> deletePayout(DealerPayout p) async {
-    final db = await database;
-    await _adjustDAmount(p.dealerId, -p.amountGiven);
-    await _tombstone('zaib_dealer_payouts', await _readSyncId('DieselLedgerCredit', 'LedgerID', p.id!));
-    return db.delete('DieselLedgerCredit', where: 'LedgerID = ?', whereArgs: [p.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('DieselLedgerCredit', 'LedgerID', p.id!, txn);
+      if (auth == null) throw Exception('Delete fail — record nahi mili.');
+      final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_payouts', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
+      final n = await txn.delete('DieselLedgerCredit', where: 'LedgerID = ?', whereArgs: [p.id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<DealerPayout>> getPayouts({String query = ''}) async {
@@ -478,26 +709,58 @@ class AppDatabase {
 
   // ---------- DealerAmount (AddStock) ----------
   Future<int> insertDealerAmount(DealerAmountEntry e) async {
-    final map = e.toMap()..remove('Sid');
-    final id = await _insertAndNotify('AddStock', map);
-    await _adjustDdAmount(e.dealerId, e.amount);
-    return id;
+    return _runLocalWrite((txn) async {
+      final map = e.toMap()..remove('Sid');
+      SyncMeta.stampNew(map);
+      final id = await txn.insert('AddStock', map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amount,
+        dDelta: 0,
+      );
+      return id;
+    });
   }
 
   Future<int> updateDealerAmount(DealerAmountEntry oldE, DealerAmountEntry e) async {
-    await _adjustDdAmount(oldE.dealerId, -oldE.amount);
-    await _adjustDdAmount(e.dealerId, e.amount);
-    final map = e.toMap()..remove('Sid');
-    final existing = await _readSyncId('AddStock', 'Sid', e.id!);
-    if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
-    return _updateAndNotify('AddStock', map, 'Sid = ?', [e.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('AddStock', 'Sid', e.id!, txn);
+      if (auth == null) throw Exception('Update fail — record nahi mili.');
+      final map = e.toMap()..remove('Sid');
+      final existing = auth['SyncId']?.toString();
+      if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update('AddStock', map, where: 'Sid = ?', whereArgs: [e.id]);
+      if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amount,
+        dDelta: 0,
+      );
+      return n;
+    });
   }
 
   Future<int> deleteDealerAmount(DealerAmountEntry e) async {
-    final db = await database;
-    await _adjustDdAmount(e.dealerId, -e.amount);
-    await _tombstone('zaib_dealer_purchases', await _readSyncId('AddStock', 'Sid', e.id!));
-    return db.delete('AddStock', where: 'Sid = ?', whereArgs: [e.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('AddStock', 'Sid', e.id!, txn);
+      if (auth == null) throw Exception('Delete fail — record nahi mili.');
+      final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_purchases', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
+      final n = await txn.delete('AddStock', where: 'Sid = ?', whereArgs: [e.id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<DealerAmountEntry>> getDealerAmounts({String query = '', String? from, String? to}) async {
@@ -529,26 +792,58 @@ class AppDatabase {
 
   // ---------- Direct Dealer Amount (DieselLedgerDebit) ----------
   Future<int> insertDirect(DirectDealerAmount e) async {
-    final map = e.toMap()..remove('LedgerID');
-    final id = await _insertAndNotify('DieselLedgerDebit', map);
-    await _adjustDdAmount(e.dealerId, e.amountGiven);
-    return id;
+    return _runLocalWrite((txn) async {
+      final map = e.toMap()..remove('LedgerID');
+      SyncMeta.stampNew(map);
+      final id = await txn.insert('DieselLedgerDebit', map);
+      if (id <= 0) throw Exception('Save fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amountGiven,
+        dDelta: 0,
+      );
+      return id;
+    });
   }
 
   Future<int> updateDirect(DirectDealerAmount oldE, DirectDealerAmount e) async {
-    await _adjustDdAmount(oldE.dealerId, -oldE.amountGiven);
-    await _adjustDdAmount(e.dealerId, e.amountGiven);
-    final map = e.toMap()..remove('LedgerID');
-    final existing = await _readSyncId('DieselLedgerDebit', 'LedgerID', e.id!);
-    if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
-    return _updateAndNotify('DieselLedgerDebit', map, 'LedgerID = ?', [e.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('DieselLedgerDebit', 'LedgerID', e.id!, txn);
+      if (auth == null) throw Exception('Update fail — record nahi mili.');
+      final map = e.toMap()..remove('LedgerID');
+      final existing = auth['SyncId']?.toString();
+      if (existing != null && existing.isNotEmpty) map['SyncId'] = existing;
+      SyncMeta.stampUpdate(map);
+      final n = await txn.update('DieselLedgerDebit', map, where: 'LedgerID = ?', whereArgs: [e.id]);
+      if (n <= 0) throw Exception('Update fail — 0 rows.');
+      await _reconcileChildBalance(
+        txn,
+        sourceSyncId: map['SyncId']!.toString(),
+        dealerId: e.dealerId,
+        ddDelta: e.amountGiven,
+        dDelta: 0,
+      );
+      return n;
+    });
   }
 
   Future<int> deleteDirect(DirectDealerAmount e) async {
-    final db = await database;
-    await _adjustDdAmount(e.dealerId, -e.amountGiven);
-    await _tombstone('zaib_dealer_direct', await _readSyncId('DieselLedgerDebit', 'LedgerID', e.id!));
-    return db.delete('DieselLedgerDebit', where: 'LedgerID = ?', whereArgs: [e.id]);
+    return _runLocalWrite((txn) async {
+      final auth = await _readRow('DieselLedgerDebit', 'LedgerID', e.id!, txn);
+      if (auth == null) throw Exception('Delete fail — record nahi mili.');
+      final syncId = auth['SyncId']?.toString() ?? '';
+      final expectedRev = SyncMeta.asServerRev(auth['ServerRev']);
+      if (syncId.isNotEmpty) {
+        await DealerBalanceApply.reverse(db: txn, sourceSyncId: syncId, markDealerDirty: false);
+      }
+      await _tombstone('zaib_dealer_direct', syncId.isEmpty ? null : syncId,
+          expectedServerRev: expectedRev, executor: txn);
+      final n = await txn.delete('DieselLedgerDebit', where: 'LedgerID = ?', whereArgs: [e.id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<DirectDealerAmount>> getDirects({String query = ''}) async {
@@ -578,9 +873,13 @@ class AppDatabase {
   }
 
   Future<int> deleteStock(int id) async {
-    final db = await database;
-    await _tombstone('zaib_stock_diesel', await _readSyncId('StockDiesel', 'SID', id));
-    return db.delete('StockDiesel', where: 'SID = ?', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final meta = await _readSyncMeta('StockDiesel', 'SID', id, txn);
+      await _tombstone('zaib_stock_diesel', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('StockDiesel', where: 'SID = ?', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<StockDieselEntry>> getStocks({String query = ''}) async {
@@ -610,9 +909,13 @@ class AppDatabase {
   }
 
   Future<int> deleteBank(int id) async {
-    final db = await database;
-    await _tombstone('zaib_bank_transactions', await _readSyncId('BankTransactions', 'Id', id));
-    return db.delete('BankTransactions', where: 'Id = ?', whereArgs: [id]);
+    return _runLocalWrite((txn) async {
+      final meta = await _readSyncMeta('BankTransactions', 'Id', id, txn);
+      await _tombstone('zaib_bank_transactions', meta.syncId, expectedServerRev: meta.serverRev, executor: txn);
+      final n = await txn.delete('BankTransactions', where: 'Id = ?', whereArgs: [id]);
+      if (n <= 0) throw Exception('Delete fail — 0 rows.');
+      return n;
+    });
   }
 
   Future<List<BankTransaction>> getBanks({String query = ''}) async {
@@ -654,10 +957,34 @@ class AppDatabase {
     final db = await database;
     final filter = _dateFilterSql('Date', year: year, month: month, from: from, to: to);
     final inRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0) + IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE 1=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN 0
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE 1=1$filter
+      ''',
     );
     final creditRow = await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Credit,0)),0) AS t FROM PetrolAdd WHERE 1=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(IsInitialEntry, 1) = 0 THEN
+            CASE
+              WHEN IFNULL(Credit, 0) <> 0 THEN IFNULL(Credit, 0)
+              ELSE IFNULL(Amount, 0) + IFNULL(Advance, 0)
+            END
+          ELSE IFNULL(Credit, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE 1=1$filter
+      ''',
     );
     final totalAmount = asDouble(inRow.first['t']);
     final totalCredit = asDouble(creditRow.first['t']);
@@ -688,7 +1015,17 @@ class AppDatabase {
       'SELECT IFNULL(SUM(IFNULL(AddDisel,0)),0) AS t FROM AddStock WHERE 1=1$filter',
     )).first['t']);
     final saleAmount = asDouble((await db.rawQuery(
-      'SELECT IFNULL(SUM(IFNULL(Amount,0)+IFNULL(Advance,0)),0) AS t FROM PetrolAdd WHERE IFNULL(IsInitialEntry,1)=1$filter',
+      '''
+      SELECT IFNULL(SUM(
+        CASE
+          WHEN IFNULL(Litter, 0) = 0 AND IFNULL(Rate, 0) = 0
+            THEN IFNULL(Amount, 0) + IFNULL(Advance, 0)
+          ELSE IFNULL(Litter, 0) * IFNULL(Rate, 0) + IFNULL(Advance, 0)
+        END
+      ), 0) AS t
+      FROM PetrolAdd
+      WHERE IFNULL(IsInitialEntry,1)=1$filter
+      ''',
     )).first['t']);
     final purchaseAmount = asDouble((await db.rawQuery(
       'SELECT IFNULL(SUM(IFNULL(AddDisel,0)*IFNULL(Rate,0)),0) AS t FROM AddStock WHERE 1=1$filter',

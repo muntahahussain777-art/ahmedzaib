@@ -94,6 +94,10 @@ class DieselSale {
     required this.note,
   });
 
+  /// WinForms VIP Amount column for a diesel sale row.
+  double get vipAmount =>
+      (litter == 0 && rate == 0) ? (amount + advance) : (litter * rate + advance);
+
   Map<String, Object?> toMap() => {
         'pid': id,
         'CustomerId': customerId,

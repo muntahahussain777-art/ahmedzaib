@@ -9,6 +9,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ZaibPetroleumService.Services;
 
 namespace ZaibPetroleumService.Model
 {
@@ -105,29 +106,68 @@ namespace ZaibPetroleumService.Model
                 return;
             }
 
-            // Prepare query for database
-            string qry = "";
-            if (id == 0)
+            decimal newDd = string.IsNullOrWhiteSpace(txtmobile.Text) ? 0 : Convert.ToDecimal(txtmobile.Text.Replace(",", ""));
+            decimal newD = DAmount;
+            string dateText = dateValue.ToString("yyyy-MM-dd");
+            int saveDid = id;
+            string qry = saveDid == 0
+                ? "INSERT INTO AddDealer (DealerName, DDAmount, DAmount, Date) VALUES (@name, @Amount, @DAmount, @date)"
+                : "UPDATE AddDealer SET DealerName = @name, DDAmount = @Amount, DAmount = @DAmount, Date = @date WHERE Did = @id";
+            var ht = new Hashtable
             {
-                qry = "INSERT INTO AddDealer (DealerName, DDAmount, DAmount, Date) VALUES (@name, @Amount, @DAmount, @date)";
-            }
-            else
+                { "@id", saveDid },
+                { "@name", txtname.Text },
+                { "@Amount", newDd },
+                { "@DAmount", newD },
+                { "@date", dateText }
+            };
+
+            bool ok = MainClass.RunInTransaction((conn, tx) =>
             {
-                qry = "UPDATE AddDealer SET DealerName = @name, DDAmount = @Amount, DAmount = @DAmount, Date = @date WHERE Did = @id";
-            }
+                decimal oldDd = 0;
+                decimal oldD = 0;
+                if (saveDid > 0)
+                {
+                    DataRow old = LocalPersistence.ReadRow("AddDealer", "Did", saveDid, conn, tx);
+                    if (old == null) return false;
+                    oldDd = old["DDAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(old["DDAmount"]);
+                    oldD = old["DAmount"] == DBNull.Value ? 0 : Convert.ToDecimal(old["DAmount"]);
+                }
+                if (MainClass.ExecInTx(qry, ht, conn, tx) <= 0) return false;
+                int savedId = saveDid;
+                if (savedId == 0)
+                {
+                    object rid = LocalPersistence.Scalar("SELECT CAST(last_insert_rowid() AS INTEGER)", null, conn, tx);
+                    if (rid == null || rid == DBNull.Value) return false;
+                    savedId = Convert.ToInt32(rid);
+                }
+                DataRow dealer = LocalPersistence.ReadRow("AddDealer", "Did", savedId, conn, tx);
+                if (dealer == null) return false;
+                string dealerSyncId = dealer["SyncId"]?.ToString();
+                if (string.IsNullOrWhiteSpace(dealerSyncId)) return false;
 
-            Hashtable ht = new Hashtable
-    {
-        { "@id", id },
-        { "@name", txtname.Text },
-        // Set DDAmount to 0 if txtmobile is empty
-        { "@Amount", string.IsNullOrWhiteSpace(txtmobile.Text) ? 0 : Convert.ToDecimal(txtmobile.Text) },
-        { "@DAmount", DAmount },  // DAmount from the variable
-        { "@date", dateValue.ToString("yyyy-MM-dd") } // Convert date to proper format
-    };
+                if (saveDid > 0)
+                {
+                    double ddDelta = (double)(newDd - oldDd);
+                    double dDelta = (double)(newD - oldD);
+                    if (Math.Abs(ddDelta) > 1e-9 || Math.Abs(dDelta) > 1e-9)
+                    {
+                        if (!SupabaseSyncService.EnqueueDealerBalanceOpInTx(
+                                conn, tx, savedId, dealerSyncId, ddDelta, dDelta, dateText, "manual", null))
+                            return false;
+                    }
+                }
+                else if (Math.Abs((double)newDd) > 1e-9 || Math.Abs((double)newD) > 1e-9)
+                {
+                    if (!SupabaseSyncService.EnqueueDealerBalanceOpInTx(
+                            conn, tx, savedId, dealerSyncId, (double)newDd, (double)newD, dateText,
+                            "opening", "opening:" + dealerSyncId))
+                        return false;
+                }
+                return true;
+            });
 
-            int r = MainClass.DataInsertUpdateDelete(qry, ht);
-            if (r > 0)
+            if (ok)
             {
                 CustomeMessage customMessageBox = new CustomeMessage("Saved Successfully", "Save");
                 customMessageBox.ShowDialog();
@@ -160,11 +200,7 @@ namespace ZaibPetroleumService.Model
                 }
 
                 // Agar DieselLedgerCredit mein entry nahi hai to delete karo
-                string qry = "DELETE FROM AddDealer WHERE Did = @id";
-                Hashtable ht = new Hashtable();
-                ht.Add("@id", id);
-
-                int r = MainClass.DataInsertUpdateDelete(qry, ht);
+                int r = MainClass.DeleteWithTombstone("AddDealer", "Did", id, "zaib_dealers");
                 if (r > 0)
                 {
                     CustomeMessage customMessageBox = new CustomeMessage("ڈیلیٹ کامیابی سے ہو گیا۔", "ڈیلیٹ");

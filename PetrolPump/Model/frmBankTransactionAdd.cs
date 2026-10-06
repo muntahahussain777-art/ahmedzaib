@@ -447,15 +447,8 @@ WHERE Id = @Id
                 {
                     try
                     {
-                        // Parameterized query for deletion 
-                        // (BankTransactions table ke liye)
-                        string qry = "DELETE FROM BankTransactions WHERE Id = @Id";
-
-                        Hashtable ht = new Hashtable();
-                        ht.Add("@Id", id);
-
-                        // Delete operation
-                        int resultDelete = MainClass.DataInsertUpdateDelete(qry, ht);
+                        // Parameterized deletion with SyncTombstone (prevents cloud resurrect)
+                        int resultDelete = MainClass.DeleteWithTombstone("BankTransactions", "Id", id, "zaib_bank_transactions");
 
                         if (resultDelete > 0)
                         {

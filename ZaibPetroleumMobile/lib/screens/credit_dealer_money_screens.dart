@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/report_totals.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_balance_search.dart';
 import '../widgets/vip_widgets.dart';
 
@@ -38,17 +39,19 @@ class CreditCustomerListScreen extends StatefulWidget {
   State<CreditCustomerListScreen> createState() => _CreditCustomerListScreenState();
 }
 
-class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
+class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<CreditCustomerEntry> _items = [];
+  List<String> _nameSuggestions = [];
   CustomerLedgerSummary? _totals;
   String? _matchedName;
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -57,24 +60,33 @@ class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
     final rows = await AppDatabase.instance.getCredits(query: _search.text);
     final matched = await AppDatabase.instance.findCustomerByExactName(_search.text);
     final byName = matched?.id == null ? null : await AppDatabase.instance.getCustomerLedgerSummary(matched!.id!);
     final totals = byName ?? await AppDatabase.instance.getGlobalCustomerLedger();
-    if (!mounted) return;
+    final customers = await AppDatabase.instance.getCustomers();
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _totals = totals;
       _matchedName = matched?.name;
+      _nameSuggestions = customers.map((c) => c.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
   Future<void> _open({CreditCustomerEntry? item}) async {
     final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => CreditCustomerFormScreen(entry: item)));
-    if (ok == true) _load();
+    if (ok == true) _load(showSpinner: true);
   }
 
   @override
@@ -98,10 +110,11 @@ class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-            child: TextField(
+            child: VipSuggestSearchField(
               controller: _search,
-              onChanged: (_) => _load(),
-              decoration: const InputDecoration(hintText: 'Search customer / receipt', prefixIcon: Icon(Icons.search, color: AppColors.gold)),
+              suggestions: _nameSuggestions,
+              hint: 'Customer name type / suggest',
+              onQueryChanged: (_) => _load(showSpinner: false),
             ),
           ),
           Expanded(
@@ -120,7 +133,7 @@ class _CreditCustomerListScreenState extends State<CreditCustomerListScreen> {
                             onLongPress: () async {
                               if (!await confirmDelete(context, '${e.customerName} credit delete?')) return;
                               await AppDatabase.instance.deleteCredit(e.id!);
-                              _load();
+                              _load(showSpinner: true);
                             },
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -322,15 +335,17 @@ class DealerPayoutListScreen extends StatefulWidget {
   State<DealerPayoutListScreen> createState() => _DealerPayoutListScreenState();
 }
 
-class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
+class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<DealerPayout> _items = [];
+  List<String> _nameSuggestions = [];
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -339,19 +354,28 @@ class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
     final rows = await AppDatabase.instance.getPayouts(query: _search.text);
-    if (!mounted) return;
+    final dealers = await AppDatabase.instance.getDealers();
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
+      _nameSuggestions = dealers.map((d) => d.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
   Future<void> _open({DealerPayout? item}) async {
     final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => DealerPayoutFormScreen(entry: item)));
-    if (ok == true) _load();
+    if (ok == true) _load(showSpinner: true);
   }
 
   @override
@@ -367,10 +391,11 @@ class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-            child: TextField(
+            child: VipSuggestSearchField(
               controller: _search,
-              onChanged: (_) => _load(),
-              decoration: const InputDecoration(hintText: 'Search dealer', prefixIcon: Icon(Icons.search, color: AppColors.gold)),
+              suggestions: _nameSuggestions,
+              hint: 'Dealer name type / suggest',
+              onQueryChanged: (_) => _load(showSpinner: false),
             ),
           ),
           Expanded(
@@ -389,7 +414,7 @@ class _DealerPayoutListScreenState extends State<DealerPayoutListScreen> {
                             onLongPress: () async {
                               if (!await confirmDelete(context, '${e.dealerName} payout delete?')) return;
                               await AppDatabase.instance.deletePayout(e);
-                              _load();
+                              _load(showSpinner: true);
                             },
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -559,20 +584,22 @@ class DealerAmountListScreen extends StatefulWidget {
   State<DealerAmountListScreen> createState() => _DealerAmountListScreenState();
 }
 
-class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
+class _DealerAmountListScreenState extends State<DealerAmountListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   final _from = TextEditingController();
   final _to = TextEditingController();
   List<DealerAmountEntry> _items = [];
+  List<String> _nameSuggestions = [];
   DealerLedgerSummary? _dealerTotals;
   String? _matchedDealer;
   LitterRateAvgSummary? _avg;
   bool _loading = true;
+  bool _initial = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(showSpinner: true);
   }
 
   @override
@@ -583,8 +610,14 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = false}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner || _initial) {
+      if (mounted) setState(() => _loading = true);
+    }
     final from = _from.text.trim();
     final to = _to.text.trim();
     final rows = await AppDatabase.instance.getDealerAmounts(
@@ -597,19 +630,22 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
         ? null
         : await AppDatabase.instance.getDealerLedgerSummary(dealerMatched!.id!);
     final avg = LitterRateAvgSummary.fromDealerAmount(rows);
-    if (!mounted) return;
+    final dealers = await AppDatabase.instance.getDealers();
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _dealerTotals = dealerTotals;
       _matchedDealer = dealerMatched?.name;
       _avg = avg;
+      _nameSuggestions = dealers.map((d) => d.name).where((n) => n.trim().isNotEmpty).toList();
       _loading = false;
+      _initial = false;
     });
   }
 
   Future<void> _open({DealerAmountEntry? item}) async {
     final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => DealerAmountFormScreen(entry: item)));
-    if (ok == true) _load();
+    if (ok == true) _load(showSpinner: true);
   }
 
   @override
@@ -643,10 +679,11 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Column(
               children: [
-                TextField(
+                VipSuggestSearchField(
                   controller: _search,
-                  onChanged: (_) => _load(),
-                  decoration: const InputDecoration(hintText: 'Search dealer / vehicle', prefixIcon: Icon(Icons.search, color: AppColors.gold)),
+                  suggestions: _nameSuggestions,
+                  hint: 'Dealer name type / suggest',
+                  onQueryChanged: (_) => _load(showSpinner: false),
                 ),
                 const SizedBox(height: 8),
                 Row(
@@ -658,7 +695,7 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
                         readOnly: true,
                         onTap: () async {
                           await pickVipDate(context, _from);
-                          _load();
+                          _load(showSpinner: true);
                         },
                         suffix: const Icon(Icons.calendar_month, color: AppColors.gold),
                       ),
@@ -671,7 +708,7 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
                         readOnly: true,
                         onTap: () async {
                           await pickVipDate(context, _to);
-                          _load();
+                          _load(showSpinner: true);
                         },
                         suffix: const Icon(Icons.calendar_month, color: AppColors.gold),
                       ),
@@ -697,7 +734,7 @@ class _DealerAmountListScreenState extends State<DealerAmountListScreen> {
                             onLongPress: () async {
                               if (!await confirmDelete(context, '${e.dealerName} purchase delete?')) return;
                               await AppDatabase.instance.deleteDealerAmount(e);
-                              _load();
+                              _load(showSpinner: true);
                             },
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -886,7 +923,7 @@ class DirectDealerListScreen extends StatefulWidget {
   State<DirectDealerListScreen> createState() => _DirectDealerListScreenState();
 }
 
-class _DirectDealerListScreenState extends State<DirectDealerListScreen> {
+class _DirectDealerListScreenState extends State<DirectDealerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<DirectDealerAmount> _items = [];
   bool _loading = true;
@@ -903,10 +940,14 @@ class _DirectDealerListScreenState extends State<DirectDealerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final rows = await AppDatabase.instance.getDirects(query: _search.text);
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _loading = false;

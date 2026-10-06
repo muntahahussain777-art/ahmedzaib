@@ -143,11 +143,7 @@ namespace ZaibPetroleumService.Model
                 {
                     try
                     {
-                        string qry = "DELETE FROM Expensetable WHERE sid = @id";
-                        Hashtable ht = new Hashtable();
-                        ht.Add("@id", id);
-
-                        int r = MainClass.DataInsertUpdateDelete(qry, ht);
+                        int r = MainClass.DeleteWithTombstone("Expensetable", "sid", id, "zaib_expenses");
                         if (r > 0)
                         {
                             CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");

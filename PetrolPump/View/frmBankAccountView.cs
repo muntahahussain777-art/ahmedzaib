@@ -446,9 +446,11 @@ namespace DigiKhataApp
             {
                 if (rowCount > 0)
                 {
-                    int deleted = MainClass.DataInsertUpdateDelete(
-                        "DELETE FROM BankTransactions WHERE TRIM(IFNULL(BankName,'')) = @Bank COLLATE NOCASE",
-                        new Hashtable { { "@Bank", bankName } });
+                    int deleted = MainClass.DeleteMatchingWithTombstones(
+                        "BankTransactions",
+                        "TRIM(IFNULL(BankName,'')) = @Bank COLLATE NOCASE",
+                        new Hashtable { { "@Bank", bankName } },
+                        "zaib_bank_transactions");
                     if (deleted < 0)
                     {
                         MessageBox.Show("Bank delete nahi hui. Dobara try karein.", "Error",
@@ -1729,8 +1731,7 @@ ORDER BY BT.Id ASC";
 
             if (row.Cells["Id"].Value != null && int.TryParse(row.Cells["Id"].Value.ToString(), out int id) && id > 0)
             {
-                var ht = new Hashtable { { "@Id", id } };
-                MainClass.DataInsertUpdateDelete("DELETE FROM BankTransactions WHERE Id=@Id", ht);
+                MainClass.DeleteWithTombstone("BankTransactions", "Id", id, "zaib_bank_transactions");
                 LoadData();
                 return;
             }

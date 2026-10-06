@@ -86,10 +86,7 @@ namespace ZaibPetroleumService.Model
 
             try
             {
-                string qry = "DELETE FROM AddCustomer WHERE id=@id";
-                Hashtable ht = new Hashtable { { "@id", id } };
-
-                int result = MainClass.DataInsertUpdateDelete(qry, ht);
+                int result = MainClass.DeleteWithTombstone("AddCustomer", "id", id, "zaib_customers");
                 if (result > 0)
                 {
                     new CustomeMessage("Record delete ho gaya!", "Success").ShowDialog();

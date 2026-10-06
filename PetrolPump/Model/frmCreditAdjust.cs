@@ -1,4 +1,4 @@
-﻿using ZaibPetroleumService.ReportForm;
+using ZaibPetroleumService.ReportForm;
 using System;
 using System.Collections;
 using System.Data;
@@ -52,9 +52,19 @@ namespace ZaibPetroleumService.Model
                 if (confirmDelete == DialogResult.Yes)
                 {
                     int id = Convert.ToInt32(guna2DataGridView1.CurrentRow.Cells["dgvid"].Value);
-                    string qry = "DELETE FROM PetrolAdd WHERE pid = " + id;
-                    Hashtable ht = new Hashtable();
-                    MainClass.DataInsertUpdateDelete(qry, ht);
+                    int customerIdForRepair = 0;
+                    try
+                    {
+                        var htC = new Hashtable { { "@pid", id } };
+                        DataTable dtC = MainClass.ExecuteSelectQuery(
+                            "SELECT CustomerId FROM PetrolAdd WHERE pid=@pid LIMIT 1", htC);
+                        if (dtC != null && dtC.Rows.Count > 0 && dtC.Rows[0][0] != DBNull.Value)
+                            customerIdForRepair = Convert.ToInt32(dtC.Rows[0][0]);
+                    }
+                    catch { }
+                    MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
+                    if (customerIdForRepair > 0)
+                        Services.BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerIdForRepair);
                     MessageBox.Show("Record deleted successfully.");
                     LoadData1();
                 }

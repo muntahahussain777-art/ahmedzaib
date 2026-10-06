@@ -279,11 +279,7 @@ namespace ZaibPetroleumService.Model
                     YesOrNoMessage confirmDelete = new YesOrNoMessage("Kya aap is record ko delete karna chahte hain?", "Confirm Delete");
                     if (confirmDelete.ShowDialog() == DialogResult.Yes)
                     {
-                        string qry = "DELETE FROM StockDiesel WHERE SID = @id";
-                        Hashtable htDelete = new Hashtable();
-                        htDelete.Add("@id", id);
-
-                        int deleteResult = MainClass.DataInsertUpdateDelete(qry, htDelete);
+                        int deleteResult = MainClass.DeleteWithTombstone("StockDiesel", "SID", id, "zaib_stock_diesel");
                         if (deleteResult > 0)
                         {
                             CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");

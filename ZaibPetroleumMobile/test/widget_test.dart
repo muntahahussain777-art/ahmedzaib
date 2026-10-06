@@ -2,8 +2,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:zaib_petroleum_mobile/main.dart';
 
 void main() {
-  testWidgets('App loads home brand', (WidgetTester tester) async {
+  testWidgets('App loads login brand', (WidgetTester tester) async {
     await tester.pumpWidget(const ZaibPetroleumApp());
-    expect(find.textContaining('Zaib Petroleum'), findsWidgets);
+    await tester.pump(); // first frame (LoginScreen)
+    // App home is LoginScreen; brand is uppercase on that screen.
+    expect(find.textContaining('ZAIB PETROLEUM'), findsWidgets);
   });
 }

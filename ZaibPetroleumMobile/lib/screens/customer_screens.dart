@@ -6,6 +6,7 @@ import '../data/app_database.dart';
 import '../models/models.dart';
 import '../theme/app_theme.dart';
 import '../utils/form_utils.dart';
+import '../widgets/sync_aware_reload.dart';
 import '../widgets/vip_widgets.dart';
 
 class CustomerListScreen extends StatefulWidget {
@@ -15,7 +16,7 @@ class CustomerListScreen extends StatefulWidget {
   State<CustomerListScreen> createState() => _CustomerListScreenState();
 }
 
-class _CustomerListScreenState extends State<CustomerListScreen> {
+class _CustomerListScreenState extends State<CustomerListScreen> with SyncAwareReload {
   final _search = TextEditingController();
   List<Customer> _items = [];
   bool _loading = true;
@@ -32,10 +33,14 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  @override
+  Future<void> reloadAfterSync() => _load(showSpinner: false);
+
+  Future<void> _load({bool showSpinner = true}) async {
+    final gen = bumpLoadGeneration();
+    if (showSpinner && mounted) setState(() => _loading = true);
     final rows = await AppDatabase.instance.getCustomers(query: _search.text);
-    if (!mounted) return;
+    if (!mounted || !isLoadCurrent(gen)) return;
     setState(() {
       _items = rows;
       _loading = false;

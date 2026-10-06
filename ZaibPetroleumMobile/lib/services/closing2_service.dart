@@ -59,7 +59,23 @@ class Closing2Service {
 
     final custBal = await db.rawQuery('''
       SELECT c.id AS cid, c.Name AS name,
-             IFNULL(SUM(IFNULL(p.Amount,0) + IFNULL(p.Advance,0) - IFNULL(p.Credit,0)), 0) AS bal
+             IFNULL(SUM(
+               CASE
+                 WHEN IFNULL(p.IsInitialEntry, 1) = 0 THEN 0
+                 WHEN IFNULL(p.Litter, 0) = 0 AND IFNULL(p.Rate, 0) = 0
+                   THEN IFNULL(p.Amount, 0) + IFNULL(p.Advance, 0)
+                 ELSE IFNULL(p.Litter, 0) * IFNULL(p.Rate, 0) + IFNULL(p.Advance, 0)
+               END
+               -
+               CASE
+                 WHEN IFNULL(p.IsInitialEntry, 1) = 0 THEN
+                   CASE
+                     WHEN IFNULL(p.Credit, 0) <> 0 THEN IFNULL(p.Credit, 0)
+                     ELSE IFNULL(p.Amount, 0) + IFNULL(p.Advance, 0)
+                   END
+                 ELSE IFNULL(p.Credit, 0)
+               END
+             ), 0) AS bal
       FROM PetrolAdd p
       INNER JOIN AddCustomer c ON c.id = p.CustomerId
       GROUP BY c.id, c.Name

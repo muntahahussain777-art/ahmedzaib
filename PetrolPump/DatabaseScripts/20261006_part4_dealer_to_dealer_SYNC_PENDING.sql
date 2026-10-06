@@ -1,0 +1,18 @@
+-- DealertoDealer (dealer-to-dealer transfers) — LOCAL ONLY / SYNC PENDING
+-- =============================================================================
+-- WinForms table: DealertoDealer
+-- There is NO approved public.zaib_* cloud table yet for this feature.
+--
+-- DO NOT:
+--   - Add DealertoDealer to Supabase push/pull whitelists without a reviewed migration.
+--   - Blindly backfill SyncId rows into a future cloud table from production SQLite.
+--
+-- Client prep (already in EnsureLocalSyncReady when table exists):
+--   SyncId, UpdatedAt, SyncDirty columns on DealertoDealer only.
+--
+-- When cloud schema is approved, add a NEW migration (not this file) that:
+--   1) Creates zaib_dealer_to_dealer (or agreed name) with sync_id PK / LWW triggers.
+--   2) Documents one-time import rules and idempotency (source_sync_id if needed).
+--
+-- This script is documentation-only; safe to run (no-op):
+SELECT 'dealer_to_dealer_sync_pending_no_cloud_table' AS notice;

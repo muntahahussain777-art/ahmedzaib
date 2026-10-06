@@ -205,30 +205,24 @@ namespace ZaibPetroleumService.Model
             // 1) Customer ki balance entry remove
             string dateStr = oldDate.ToString("yyyy-MM-dd");
 
-            string deleteCust = @"
-                DELETE FROM PetrolAdd 
-                WHERE CustomerId = @CustomerId
-                  AND ReceiptNo = 'CustomerToCustomer'
-                  AND Date = @PaymentDate
-                  AND IsInitialEntry = 1
-            ";
             Hashtable htCust = new Hashtable();
             htCust.Add("@CustomerId", oldCustomerId);
             htCust.Add("@PaymentDate", dateStr);
-            MainClass.DataInsertUpdateDelete(deleteCust, htCust);
+            MainClass.DeleteMatchingWithTombstones(
+                "PetrolAdd",
+                "CustomerId = @CustomerId AND ReceiptNo = 'CustomerToCustomer' AND Date = @PaymentDate AND IsInitialEntry = 1",
+                htCust,
+                "zaib_petrol_entries");
 
             // 2) Dealer ki credit entry remove
-            string deleteDealer = @"
-                DELETE FROM PetrolAdd
-                WHERE CustomerId = @DealerId
-                  AND ReceiptNo = 'CustomerToCustomer'
-                  AND Date = @PaymentDate
-                  AND IsInitialEntry = 0
-            ";
             Hashtable htDealer = new Hashtable();
             htDealer.Add("@DealerId", oldDealerId);
             htDealer.Add("@PaymentDate", dateStr);
-            MainClass.DataInsertUpdateDelete(deleteDealer, htDealer);
+            MainClass.DeleteMatchingWithTombstones(
+                "PetrolAdd",
+                "CustomerId = @DealerId AND ReceiptNo = 'CustomerToCustomer' AND Date = @PaymentDate AND IsInitialEntry = 0",
+                htDealer,
+                "zaib_petrol_entries");
 
             // ab hum CustomerToCustomer se row nahin hata rahe 
             // kyunke hum update kar rahe hain, poora row delete nahin karna
@@ -385,34 +379,28 @@ namespace ZaibPetroleumService.Model
                 string paymentDate = Convert.ToDateTime(dt.Rows[0]["Date"]).ToString("yyyy-MM-dd");
 
                 // Step 2: remove from PetrolAdd (customer's entry)
-                string deleteCustomerBalanceQuery = @"
-                    DELETE FROM PetrolAdd
-                    WHERE CustomerId = @CustomerId
-                      AND ReceiptNo = 'CustomerToCustomer'
-                      AND Date = @PaymentDate
-                      AND IsInitialEntry = 1
-                ";
                 Hashtable htCust = new Hashtable
                 {
                     { "@CustomerId",  customerId },
                     { "@PaymentDate", paymentDate }
                 };
-                MainClass.DataInsertUpdateDelete(deleteCustomerBalanceQuery, htCust);
+                MainClass.DeleteMatchingWithTombstones(
+                    "PetrolAdd",
+                    "CustomerId = @CustomerId AND ReceiptNo = 'CustomerToCustomer' AND Date = @PaymentDate AND IsInitialEntry = 1",
+                    htCust,
+                    "zaib_petrol_entries");
 
                 // Step 3: remove from PetrolAdd (dealer's entry)
-                string deleteDealerCreditQuery = @"
-                    DELETE FROM PetrolAdd
-                    WHERE CustomerId = @DealerId
-                      AND ReceiptNo = 'CustomerToCustomer'
-                      AND Date = @PaymentDate
-                      AND IsInitialEntry = 0
-                ";
                 Hashtable htDealer = new Hashtable
                 {
                     { "@DealerId",  dealerId },
                     { "@PaymentDate", paymentDate }
                 };
-                MainClass.DataInsertUpdateDelete(deleteDealerCreditQuery, htDealer);
+                MainClass.DeleteMatchingWithTombstones(
+                    "PetrolAdd",
+                    "CustomerId = @DealerId AND ReceiptNo = 'CustomerToCustomer' AND Date = @PaymentDate AND IsInitialEntry = 0",
+                    htDealer,
+                    "zaib_petrol_entries");
 
                 // Step 4: remove from CustomerToCustomer
                 string deleteLedgerQuery = "DELETE FROM CustomerToCustomer WHERE LedgerID = @LedgerID";
