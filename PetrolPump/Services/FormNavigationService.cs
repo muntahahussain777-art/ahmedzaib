@@ -139,6 +139,9 @@ namespace ZaibPetroleumService.Services
         private static Form CreateForm(string formName)
         {
             Type type = ResolveFormType(formName);
+            if (type == null &&
+                string.Equals(formName, "frmDieselLedgerView", StringComparison.OrdinalIgnoreCase))
+                type = typeof(frmDealerAmountCombinedView);
             if (type == null)
                 return null;
 
@@ -294,7 +297,7 @@ namespace ZaibPetroleumService.Services
 Ctrl+D=frmDiselView|Daily Diesel Sales
 Ctrl+C=frmCreditAdjust|Credit Customer
 Ctrl+A=frmDealerNameView|Add Dealer
-Ctrl+P=frmDieselLedgerView|Dealer Payout
+Ctrl+P=frmDealerAmountCombinedView|Dealer Amount
 Ctrl+M=frmStockView|DealerAmount
 Ctrl+I=FrmDirectDealerPaymentAmountView|Direct Dealer Amount
 Ctrl+U=frmCustomerView|Add Customer

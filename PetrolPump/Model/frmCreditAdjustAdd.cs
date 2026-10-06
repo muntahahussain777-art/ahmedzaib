@@ -1,4 +1,4 @@
-﻿using Guna.UI2.WinForms;
+using Guna.UI2.WinForms;
 using ZaibPetroleumService.Services;
 using System;
 using System.Collections;
@@ -373,6 +373,7 @@ namespace ZaibPetroleumService.Model
                 int resultSave = MainClass.DataInsertUpdateDelete(qry, ht);
                 if (resultSave > 0)
                 {
+                    BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerId);
                     CustomeMessage customMessageBox = new CustomeMessage(
                         isEdit ? "Record update ho gaya." : "Record saved successfully.", "");
                     customMessageBox.ShowDialog();
@@ -452,11 +453,23 @@ namespace ZaibPetroleumService.Model
                 {
                     try
                     {
-                        // Parameterized query for deletion
+                        int customerIdForRepair = 0;
+                        try
+                        {
+                            var htC = new Hashtable { { "@pid", id } };
+                            DataTable dtC = MainClass.ExecuteSelectQuery(
+                                "SELECT CustomerId FROM PetrolAdd WHERE pid=@pid LIMIT 1", htC);
+                            if (dtC != null && dtC.Rows.Count > 0 && dtC.Rows[0][0] != DBNull.Value)
+                                customerIdForRepair = Convert.ToInt32(dtC.Rows[0][0]);
+                        }
+                        catch { }
+
                         int resultDelete = MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
 
                         if (resultDelete > 0)
                         {
+                            if (customerIdForRepair > 0)
+                                BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerIdForRepair);
                             CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");
                             successMessage.ShowDialog();
                             this.DialogResult = DialogResult.OK; // Signal that the data was deleted

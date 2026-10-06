@@ -313,9 +313,33 @@ namespace ZaibPetroleumService.Services
                     EnsureTrigger(con, "trg_sync_DealertoDealer_au", "DealertoDealer", "UPDATE", "Date,FirstDealer,SecondDealer,AmounGiven,Note,id,Did");
                 }
 
+                // Legacy AFTER DELETE triggers INSERT OR REPLACE SyncTombstone without
+                // ExpectedServerRev/RequestId and wipe OCC fields written by DeleteWithTombstone.
+                // Soft-delete then fails push → cloud stays live → balances diverge after sync.
+                DropLegacyDeleteTombstoneTriggers(con);
+
                 // Stale guard from crash/older builds must not permanently disable dirty tracking.
                 // Never mass-mark rows dirty — that would overwrite cloud on next push.
                 ClearStaleRemoteApplyGuard(con);
+            }
+        }
+
+        /// <summary>
+        /// Remove old trg_sync_*_ad bodies that clobber OCC tombstone columns.
+        /// Deletes must go through LocalPersistence.EnsureTombstone / DeleteWithTombstone only.
+        /// </summary>
+        private static void DropLegacyDeleteTombstoneTriggers(SQLiteConnection con)
+        {
+            string[] names =
+            {
+                "trg_sync_AddCustomer_ad", "trg_sync_PetrolAdd_ad", "trg_sync_AddDealer_ad",
+                "trg_sync_DieselLedgerCredit_ad", "trg_sync_AddStock_ad", "trg_sync_DieselLedgerDebit_ad",
+                "trg_sync_StockDiesel_ad", "trg_sync_BankTransactions_ad", "trg_sync_Expensetable_ad",
+                "trg_sync_DealertoDealer_ad"
+            };
+            foreach (var name in names)
+            {
+                try { Exec(con, "DROP TRIGGER IF EXISTS " + name); } catch { }
             }
         }
 
@@ -2162,7 +2186,8 @@ END;";
                     }
                     else if (ack == UploadAck.Conflict)
                     {
-                        // Do NOT learn a newer rev and retry. Evidence-only clear, else retain.
+                        // Evidence-only on conflict. Legacy (null expected_rev): stamp live rev for retry.
+                        // Do not blind-overwrite cloud.
                         try
                         {
                             var res = await Http.GetAsync($"{Url}/rest/v1/{table}?sync_id=eq.{Uri.EscapeDataString(syncId)}&select=deleted_at,server_rev&limit=1");
@@ -2182,12 +2207,49 @@ END;";
                                 }
                                 else
                                 {
-                                    LogFail(con, "push:tombstone:conflict", syncId,
-                                        new Exception(expectedRev == null
-                                            ? "legacy tombstone missing ExpectedServerRev — retain delete intent"
-                                            : "delete conflict — retain tombstone; no blind overwrite"));
-                                    if (arr.Count > 0 && arr[0] is JObject jo)
-                                        StageRemote(con, table, jo);
+                                    // Legacy tombstone (AD trigger wiped OCC): learn live server_rev once
+                                    // so the next pass can soft-delete with a real expected_rev.
+                                    // Do NOT StageRemote the live row — that would resurrect the local delete.
+                                    if (expectedRev == null && arr.Count > 0 && arr[0]["server_rev"] != null
+                                        && arr[0]["server_rev"].Type != JTokenType.Null)
+                                    {
+                                        try
+                                        {
+                                            long liveRev = arr[0].Value<long>("server_rev");
+                                            if (liveRev > 0)
+                                            {
+                                                string req = LocalPersistence.StableTombstoneRequestId(
+                                                    table, syncId, deletedAt);
+                                                using (var u = new SQLiteCommand(
+                                                    @"UPDATE SyncTombstone
+                                                      SET ExpectedServerRev=@r, RequestId=@req
+                                                      WHERE SyncId=@s AND DeletedAt=@d", con))
+                                                {
+                                                    u.Parameters.AddWithValue("@r", liveRev);
+                                                    u.Parameters.AddWithValue("@req", req);
+                                                    u.Parameters.AddWithValue("@s", syncId);
+                                                    u.Parameters.AddWithValue("@d", deletedAt ?? "");
+                                                    u.ExecuteNonQuery();
+                                                }
+                                                LogFail(con, "push:tombstone:rev_repaired", syncId,
+                                                    new Exception("stamped ExpectedServerRev=" + liveRev + " for retry"));
+                                            }
+                                        }
+                                        catch (Exception repairEx)
+                                        {
+                                            LogFail(con, "push:tombstone:rev_repair_fail", syncId, repairEx);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        LogFail(con, "push:tombstone:conflict", syncId,
+                                            new Exception(expectedRev == null
+                                                ? "legacy tombstone missing ExpectedServerRev — retain delete intent"
+                                                : "delete conflict — retain tombstone; no blind overwrite"));
+                                        // Real OCC conflict on delete: stage server evidence for review only.
+                                        if (arr.Count > 0 && arr[0] is JObject jo)
+                                            StageRemote(con, table, jo);
+                                    }
                                 }
                             }
                         }

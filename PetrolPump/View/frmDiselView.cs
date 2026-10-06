@@ -1,4 +1,4 @@
-﻿using ZaibPetroleumService.Model;
+using ZaibPetroleumService.Model;
 using ZaibPetroleumService.ProjectConnection;
 using System;
 using System.Collections;
@@ -23,6 +23,7 @@ namespace ZaibPetroleumService.View
         private readonly Timer _searchDebounceTimer = new Timer();
         private int _loadToken;
         private static bool _dbIndexEnsured;
+        private static bool _petrolBalanceRepaired;
 
         public frmDiselView()
         {
@@ -88,6 +89,13 @@ namespace ZaibPetroleumService.View
                         cmd2.ExecuteNonQuery();
                 }
                 _dbIndexEnsured = true;
+                // One-shot: repair stale credit Balance snapshots so Credit Adjust / DB match VIP.
+                if (!_petrolBalanceRepaired)
+                {
+                    _petrolBalanceRepaired = true;
+                    try { Services.BalanceConfirmationService.RecalculateAllCustomerPetrolBalances(); }
+                    catch { }
+                }
             }
             catch { /* index optional — load still works */ }
         }
@@ -169,9 +177,38 @@ namespace ZaibPetroleumService.View
         {
             searchText = (searchText ?? string.Empty).Trim();
             // Sale + Credit dono. Credit entry (IsInitialEntry=0): Credit column mein wasooli.
-            // Sale: Litter×Rate (+Adv) Amount mein; bina litter pe Amount+Adv.
+            // Running Balance = true customer cumulative through this row (full history), same VIP formula.
+            // Works for date filter, search, vehicle filter — never starts from 0 mid-ledger.
+            const string vipRunningBalanceSql = @"
+(SELECT IFNULL(SUM(
+           CASE
+             WHEN IFNULL(p2.IsInitialEntry, 1) = 0 THEN 0
+             WHEN IFNULL(p2.Litter, 0) > 0 AND IFNULL(p2.Rate, 0) > 0
+               THEN CAST(IFNULL(p2.Litter, 0) AS REAL) * CAST(IFNULL(p2.Rate, 0) AS REAL) + IFNULL(p2.Advance, 0)
+             ELSE IFNULL(p2.Amount, 0) + IFNULL(p2.Advance, 0)
+           END
+         ), 0)
+       - IFNULL(SUM(
+           CASE
+             WHEN IFNULL(p2.IsInitialEntry, 1) = 0 THEN
+               CASE
+                 WHEN IFNULL(p2.Credit, 0) <> 0 THEN IFNULL(p2.Credit, 0)
+                 ELSE IFNULL(p2.Amount, 0) + IFNULL(p2.Advance, 0)
+               END
+             ELSE IFNULL(p2.Credit, 0)
+           END
+         ), 0)
+ FROM PetrolAdd p2
+ WHERE p2.CustomerId = PetrolAdd.CustomerId
+   AND (
+         date(p2.Date) < date(PetrolAdd.Date)
+         OR (date(p2.Date) = date(PetrolAdd.Date) AND p2.pid <= PetrolAdd.pid)
+       ))";
+
+            // Sale Amount: Litter×Rate+Adv only when BOTH Litter & Rate > 0; else Amount+Adv.
             const string selectCore = @"
 SELECT PetrolAdd.pid,
+       PetrolAdd.CustomerId,
        PetrolAdd.Date,
        PetrolAdd.ReceiptNo,
        PetrolAdd.vehicle,
@@ -180,9 +217,9 @@ SELECT PetrolAdd.pid,
        IFNULL(PetrolAdd.Advance, 0) AS Advance,
        CASE
            WHEN IFNULL(PetrolAdd.IsInitialEntry, 1) = 0 THEN 0
-           WHEN IFNULL(PetrolAdd.Litter, 0) = 0 AND IFNULL(PetrolAdd.Rate, 0) = 0
-               THEN IFNULL(PetrolAdd.Amount, 0) + IFNULL(PetrolAdd.Advance, 0)
-           ELSE CAST(IFNULL(PetrolAdd.Litter, 0) * IFNULL(PetrolAdd.Rate, 0) + IFNULL(PetrolAdd.Advance, 0) AS DECIMAL(18, 3))
+           WHEN IFNULL(PetrolAdd.Litter, 0) > 0 AND IFNULL(PetrolAdd.Rate, 0) > 0
+               THEN CAST(IFNULL(PetrolAdd.Litter, 0) * IFNULL(PetrolAdd.Rate, 0) + IFNULL(PetrolAdd.Advance, 0) AS DECIMAL(18, 3))
+           ELSE IFNULL(PetrolAdd.Amount, 0) + IFNULL(PetrolAdd.Advance, 0)
        END AS Amount,
        CASE
            WHEN IFNULL(PetrolAdd.IsInitialEntry, 1) = 0 THEN
@@ -192,7 +229,7 @@ SELECT PetrolAdd.pid,
                END
            ELSE IFNULL(PetrolAdd.Credit, 0)
        END AS CreditVal,
-       CAST(0 AS DECIMAL(18, 3)) AS Balance,
+       CAST(" + vipRunningBalanceSql + @" AS DECIMAL(18, 3)) AS Balance,
        CAST(NULL AS REAL) AS TotalBalance,
        CASE
            WHEN IFNULL(PetrolAdd.IsInitialEntry, 1) = 0 AND IFNULL(TRIM(PetrolAdd.Note), '') = ''
@@ -214,7 +251,7 @@ WHERE 1=1";
 
                 if (string.IsNullOrEmpty(searchText))
                 {
-                    // Bina search: sirf date range (pehle jaisa fast open)
+                    // Bina search: date range (Balance still full running through each row)
                     qry = selectCore + @"
   AND date(PetrolAdd.Date) >= date(@StartDate)
   AND date(PetrolAdd.Date) <= date(@EndDate)
@@ -257,43 +294,39 @@ ORDER BY AddCustomer.Name COLLATE NOCASE, PetrolAdd.Date ASC, PetrolAdd.pid ASC"
                     da.Fill(dt);
             }
 
-            ApplyVipRunningBalances(dt);
+            ApplyCustomerGroupTotalBalance(dt);
             return dt;
         }
 
-        /// VIP: Amount jama, Credit minus → har row pe running Balance; TotalBalance pehle row pe.
-        private static void ApplyVipRunningBalances(DataTable dt)
+        /// <summary>
+        /// TotalBalance on first row of each customer = that customer's last running Balance in this grid.
+        /// </summary>
+        private static void ApplyCustomerGroupTotalBalance(DataTable dt)
         {
-            if (dt == null || dt.Rows.Count == 0) return;
+            if (dt == null || dt.Rows.Count == 0 || !dt.Columns.Contains("Balance")) return;
 
-            decimal run = 0;
-            string prev = "\u0001";
-            var groupFirst = new List<int>();
-            var groupLastBal = new List<decimal>();
-
-            for (int i = 0; i < dt.Rows.Count; i++)
+            int groupStart = 0;
+            int prevCid = int.MinValue;
+            for (int i = 0; i <= dt.Rows.Count; i++)
             {
-                string cust = Convert.ToString(dt.Rows[i]["Name"]) ?? string.Empty;
-                if (!string.Equals(cust, prev, StringComparison.OrdinalIgnoreCase))
+                int cid = int.MinValue;
+                if (i < dt.Rows.Count && dt.Rows[i]["CustomerId"] != DBNull.Value)
+                    cid = Convert.ToInt32(dt.Rows[i]["CustomerId"]);
+
+                if (i == dt.Rows.Count || (prevCid != int.MinValue && cid != prevCid))
                 {
-                    if (prev != "\u0001")
-                        groupLastBal.Add(run);
-                    run = 0;
-                    groupFirst.Add(i);
-                    prev = cust;
+                    int groupEnd = i - 1;
+                    if (groupEnd >= groupStart)
+                    {
+                        decimal lastBal = ToDec(dt.Rows[groupEnd]["Balance"]);
+                        for (int r = groupStart; r <= groupEnd; r++)
+                            dt.Rows[r]["TotalBalance"] = DBNull.Value;
+                        dt.Rows[groupStart]["TotalBalance"] = lastBal;
+                    }
+                    groupStart = i;
                 }
-
-                decimal amount = ToDec(dt.Rows[i]["Amount"]);
-                decimal credit = ToDec(dt.Rows[i]["CreditVal"]);
-                run += amount;
-                run -= credit;
-                dt.Rows[i]["Balance"] = run;
-                dt.Rows[i]["TotalBalance"] = DBNull.Value;
+                prevCid = cid;
             }
-
-            groupLastBal.Add(run);
-            for (int g = 0; g < groupFirst.Count; g++)
-                dt.Rows[groupFirst[g]]["TotalBalance"] = groupLastBal[g];
         }
 
         private static decimal ToDec(object v)
@@ -372,8 +405,9 @@ ORDER BY AddCustomer.Name COLLATE NOCASE, PetrolAdd.Date ASC, PetrolAdd.pid ASC"
 
                 guna2DataGridView1.DataSource = dt;
 
-                // Guna/grid kabhi alias miss karta hai — Credit seedha DataRow se cell pe likho
+                // Guna/grid kabhi alias miss karta hai — Credit/Balance seedha DataRow se cell pe likho
                 ForceCreditCellsFromData();
+                ForceBalanceCellsFromData();
 
                 foreach (DataGridViewColumn c in guna2DataGridView1.Columns)
                 {
@@ -411,6 +445,19 @@ ORDER BY AddCustomer.Name COLLATE NOCASE, PetrolAdd.Date ASC, PetrolAdd.pid ASC"
                     c = ToDec(drv["Credit"]);
 
                 row.Cells["dgvCredit"].Value = c;
+            }
+        }
+
+        private void ForceBalanceCellsFromData()
+        {
+            if (!guna2DataGridView1.Columns.Contains("dgvBalance")) return;
+
+            foreach (DataGridViewRow row in guna2DataGridView1.Rows)
+            {
+                if (row.IsNewRow) continue;
+                if (!(row.DataBoundItem is DataRowView drv)) continue;
+                if (!drv.Row.Table.Columns.Contains("Balance")) continue;
+                row.Cells["dgvBalance"].Value = ToDec(drv["Balance"]);
             }
         }
 
@@ -613,7 +660,19 @@ ORDER BY AddCustomer.Name COLLATE NOCASE, PetrolAdd.Date ASC, PetrolAdd.pid ASC"
                     if (confirmDelete == DialogResult.Yes)
                     {
                         int id = Convert.ToInt32(guna2DataGridView1.CurrentRow.Cells["dgvid"].Value);
+                        int customerIdForRepair = 0;
+                        try
+                        {
+                            var htC = new Hashtable { { "@pid", id } };
+                            DataTable dtC = MainClass.ExecuteSelectQuery(
+                                "SELECT CustomerId FROM PetrolAdd WHERE pid=@pid LIMIT 1", htC);
+                            if (dtC != null && dtC.Rows.Count > 0 && dtC.Rows[0][0] != DBNull.Value)
+                                customerIdForRepair = Convert.ToInt32(dtC.Rows[0][0]);
+                        }
+                        catch { }
                         MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
+                        if (customerIdForRepair > 0)
+                            Services.BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerIdForRepair);
                         MessageBox.Show("Record deleted successfully.");
                         LoadData1();
                     }
@@ -785,16 +844,18 @@ ORDER BY AddCustomer.Name COLLATE NOCASE, PetrolAdd.Date ASC, PetrolAdd.pid ASC"
             lblLitter.Text = $"Total Litter: {totalLitterSum:F2} L";
             lblAmount.Text = $"Total Amount: {totalAmountSum:F2}";
 
-            // VIP search summary — Amount + Credit − → Balance
+            decimal periodNet = totalAmountSum - totalCreditSum;
+            // Footer = sirf is list ki period movement; Balance column = poori history running (SQL).
             if (!string.IsNullOrWhiteSpace(txtSearch.Text) && hasRow)
             {
                 lblResult.Text =
-                    $"VIP: Amount {totalAmountSum:F2}  −  Credit {totalCreditSum:F2}  =  Balance {totalAmountSum - totalCreditSum:F2}";
+                    $"VIP period: Amount {totalAmountSum:F2} − Credit {totalCreditSum:F2} = {periodNet:F2}  |  Balance column = running";
                 lblResult.ForeColor = Color.FromArgb(255, 215, 0);
             }
             else if (hasRow)
             {
-                lblResult.Text = $"Credit: {totalCreditSum:F2}   |   Net Balance: {totalAmountSum - totalCreditSum:F2}";
+                lblResult.Text =
+                    $"Credit {totalCreditSum:F2}  |  Period net {periodNet:F2}  |  Balance column = full running";
                 lblResult.ForeColor = Color.White;
             }
             else

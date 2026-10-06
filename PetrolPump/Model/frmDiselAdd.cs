@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
@@ -575,6 +575,7 @@ namespace ZaibPetroleumService.Model
                     int rCredit = MainClass.DataInsertUpdateDelete(qryCredit, htCredit);
                     if (rCredit > 0)
                     {
+                        BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerId);
                         CustomeMessage successMessage = new CustomeMessage(
                             isEditCredit
                                 ? "Credit entry update ho gayi! (Credit Customer mein bhi)"
@@ -659,6 +660,7 @@ namespace ZaibPetroleumService.Model
 
                 if (r > 0)
                 {
+                    BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerId);
                     CustomeMessage successMessage = new CustomeMessage(
                         isEdit ? "Entry update ho gayi!" : "Entry save ho gayi!", "Success");
                     successMessage.ShowDialog();
@@ -715,9 +717,22 @@ namespace ZaibPetroleumService.Model
                     {
                         try
                         {
+                            int customerIdForRepair = 0;
+                            try
+                            {
+                                var htC = new Hashtable { { "@pid", id } };
+                                DataTable dtC = MainClass.ExecuteSelectQuery(
+                                    "SELECT CustomerId FROM PetrolAdd WHERE pid=@pid LIMIT 1", htC);
+                                if (dtC != null && dtC.Rows.Count > 0 && dtC.Rows[0][0] != DBNull.Value)
+                                    customerIdForRepair = Convert.ToInt32(dtC.Rows[0][0]);
+                            }
+                            catch { }
+
                             int r = MainClass.DeleteWithTombstone("PetrolAdd", "pid", id, "zaib_petrol_entries");
                             if (r > 0)
                             {
+                                if (customerIdForRepair > 0)
+                                    BalanceConfirmationService.RecalculateCustomerPetrolBalances(customerIdForRepair);
                                 CustomeMessage successMessage = new CustomeMessage("Record delete ho gaya!", "Success");
                                 successMessage.ShowDialog();
                                 ResetFormKeepSelectedDate();

@@ -1,7 +1,10 @@
 using ZaibPetroleumService.Model;
+using ZaibPetroleumService.ProjectConnection;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
+using System.Data.SQLite;
 using System.Windows.Forms;
 
 namespace ZaibPetroleumService.Services
@@ -9,42 +12,197 @@ namespace ZaibPetroleumService.Services
     /// <summary>
     /// Balance 0 ya negative hone par save se pehle Yes/No confirmation.
     /// Daily Diesel Sales aur Dealer Amount forms excluded (unke save handlers mein call nahi).
+    /// Also: VIP opening carry + stored credit Balance repair after IUD.
     /// </summary>
     public static class BalanceConfirmationService
     {
+        /// <summary>
+        /// VIP sale Amount: Litter×Rate+Advance only when BOTH Litter and Rate &gt; 0; else Amount+Advance.
+        /// </summary>
+        public static decimal VipSaleAmount(decimal litter, decimal rate, decimal amount, decimal advance)
+        {
+            if (litter > 0m && rate > 0m)
+                return litter * rate + advance;
+            return amount + advance;
+        }
+
+        /// <summary>Credit column value for VIP (credit rows may store wasooli in Amount).</summary>
+        public static decimal VipCreditValue(int isInitialEntry, decimal credit, decimal amount, decimal advance)
+        {
+            if (isInitialEntry == 0)
+                return credit != 0m ? credit : amount + advance;
+            return credit;
+        }
+
+        /// <summary>
+        /// True remaining BEFORE a date (VIP formula). Used as opening when Daily Diesel is date-filtered.
+        /// </summary>
+        public static decimal GetCustomerOpeningBalanceBefore(int customerId, DateTime beforeDate)
+        {
+            string query = @"
+SELECT IFNULL(SUM(
+         CASE
+           WHEN IFNULL(IsInitialEntry,1)=0 THEN 0
+           WHEN IFNULL(Litter,0)>0 AND IFNULL(Rate,0)>0
+             THEN CAST(IFNULL(Litter,0)*IFNULL(Rate,0)+IFNULL(Advance,0) AS REAL)
+           ELSE IFNULL(Amount,0)+IFNULL(Advance,0)
+         END
+       ),0)
+     - IFNULL(SUM(
+         CASE
+           WHEN IFNULL(IsInitialEntry,1)=0 THEN
+             CASE WHEN IFNULL(Credit,0)<>0 THEN IFNULL(Credit,0)
+                  ELSE IFNULL(Amount,0)+IFNULL(Advance,0) END
+           ELSE IFNULL(Credit,0)
+         END
+       ),0)
+FROM PetrolAdd
+WHERE CustomerId=@id AND date(Date) < date(@before)";
+            var ht = new Hashtable
+            {
+                { "@id", customerId },
+                { "@before", beforeDate.ToString("yyyy-MM-dd") }
+            };
+            DataTable dt = MainClass.ExecuteSelectQuery(query, ht);
+            if (dt == null || dt.Rows.Count == 0 || dt.Rows[0][0] == DBNull.Value) return 0m;
+            return Convert.ToDecimal(dt.Rows[0][0]);
+        }
+
         public static decimal GetCustomerPetrolRemaining(int customerId)
         {
-            string query = @"SELECT 
-                IFNULL(SUM(IFNULL(Amount,0) + IFNULL(Advance,0)),0) AS TotalAmount,
-                IFNULL(SUM(IFNULL(Credit,0)),0) AS TotalCredit
-                FROM PetrolAdd WHERE CustomerId = @id";
+            // Full-history remaining with the same VIP Amount/Credit formula as Daily Diesel.
+            string query = @"
+SELECT IFNULL(SUM(
+         CASE
+           WHEN IFNULL(IsInitialEntry,1)=0 THEN 0
+           WHEN IFNULL(Litter,0)>0 AND IFNULL(Rate,0)>0
+             THEN CAST(IFNULL(Litter,0)*IFNULL(Rate,0)+IFNULL(Advance,0) AS REAL)
+           ELSE IFNULL(Amount,0)+IFNULL(Advance,0)
+         END
+       ),0)
+     - IFNULL(SUM(
+         CASE
+           WHEN IFNULL(IsInitialEntry,1)=0 THEN
+             CASE WHEN IFNULL(Credit,0)<>0 THEN IFNULL(Credit,0)
+                  ELSE IFNULL(Amount,0)+IFNULL(Advance,0) END
+           ELSE IFNULL(Credit,0)
+         END
+       ),0)
+FROM PetrolAdd
+WHERE CustomerId=@id";
             var ht = new Hashtable { { "@id", customerId } };
             DataTable dt = MainClass.ExecuteSelectQuery(query, ht);
-            if (dt == null || dt.Rows.Count == 0) return 0;
-            decimal totalAmount = Convert.ToDecimal(dt.Rows[0]["TotalAmount"]);
-            decimal totalCredit = Convert.ToDecimal(dt.Rows[0]["TotalCredit"]);
-            return totalAmount - totalCredit;
+            if (dt == null || dt.Rows.Count == 0 || dt.Rows[0][0] == DBNull.Value) return 0m;
+            return Convert.ToDecimal(dt.Rows[0][0]);
         }
 
         public static decimal GetCustomerLedgerRemaining(int customerId)
         {
-            var ht = new Hashtable { { "@customerId", customerId } };
+            // Prefer true petrol remaining (not stale SUM(Balance) snapshots).
+            return GetCustomerPetrolRemaining(customerId);
+        }
 
-            string initialQuery = @"SELECT IFNULL(SUM(Balance),0) AS InitialBalance 
-                FROM PetrolAdd WHERE CustomerId = @customerId AND IsInitialEntry = 1";
-            DataTable dtInitial = MainClass.ExecuteSelectQuery(initialQuery, ht);
-            decimal initial = 0;
-            if (dtInitial != null && dtInitial.Rows.Count > 0)
-                initial = Convert.ToDecimal(dtInitial.Rows[0]["InitialBalance"]);
+        /// <summary>
+        /// Recompute sale row deltas + credit remaining snapshots for one customer (chronological).
+        /// Suppresses SyncDirty triggers so mass repair does not force-upload every row.
+        /// </summary>
+        public static void RecalculateCustomerPetrolBalances(int customerId)
+        {
+            if (customerId <= 0) return;
+            try
+            {
+                using (var con = new SQLiteConnection(projectconnection.ConnectionString))
+                {
+                    con.Open();
+                    try { using (var g = new SQLiteCommand("INSERT OR IGNORE INTO SyncApplyGuard(Id) VALUES(1)", con)) g.ExecuteNonQuery(); } catch { }
 
-            string creditQuery = @"SELECT IFNULL(SUM(Credit),0) AS TotalCredit 
-                FROM PetrolAdd WHERE CustomerId = @customerId AND IsInitialEntry = 0";
-            DataTable dtCredit = MainClass.ExecuteSelectQuery(creditQuery, ht);
-            decimal credits = 0;
-            if (dtCredit != null && dtCredit.Rows.Count > 0)
-                credits = Convert.ToDecimal(dtCredit.Rows[0]["TotalCredit"]);
+                    DataTable rows;
+                    using (var cmd = new SQLiteCommand(
+                        @"SELECT pid, IFNULL(IsInitialEntry,1) AS IsInitialEntry,
+                                 IFNULL(Litter,0) AS Litter, IFNULL(Rate,0) AS Rate,
+                                 IFNULL(Amount,0) AS Amount, IFNULL(Advance,0) AS Advance,
+                                 IFNULL(Credit,0) AS Credit
+                          FROM PetrolAdd
+                          WHERE CustomerId=@id
+                          ORDER BY date(Date) ASC, pid ASC", con))
+                    {
+                        cmd.Parameters.AddWithValue("@id", customerId);
+                        using (var da = new SQLiteDataAdapter(cmd))
+                        {
+                            rows = new DataTable();
+                            da.Fill(rows);
+                        }
+                    }
 
-            return initial - credits;
+                    decimal run = 0m;
+                    using (var tx = con.BeginTransaction())
+                    {
+                        foreach (DataRow r in rows.Rows)
+                        {
+                            int pid = Convert.ToInt32(r["pid"]);
+                            int isInit = Convert.ToInt32(r["IsInitialEntry"]);
+                            decimal litter = Convert.ToDecimal(r["Litter"]);
+                            decimal rate = Convert.ToDecimal(r["Rate"]);
+                            decimal amount = Convert.ToDecimal(r["Amount"]);
+                            decimal advance = Convert.ToDecimal(r["Advance"]);
+                            decimal credit = Convert.ToDecimal(r["Credit"]);
+
+                            decimal balToStore;
+                            if (isInit == 0)
+                            {
+                                decimal credVal = VipCreditValue(0, credit, amount, advance);
+                                run -= credVal;
+                                balToStore = run; // remaining after this credit
+                            }
+                            else
+                            {
+                                decimal saleAmt = VipSaleAmount(litter, rate, amount, advance);
+                                decimal saleCred = credit;
+                                run += saleAmt;
+                                run -= saleCred;
+                                // Sale stored Balance stays per-row delta (Amount−Credit+Advance), matching save form.
+                                balToStore = amount - credit + advance;
+                            }
+
+                            using (var u = new SQLiteCommand(
+                                "UPDATE PetrolAdd SET Balance=@b WHERE pid=@p", con, tx))
+                            {
+                                u.Parameters.AddWithValue("@b", balToStore.ToString("F2"));
+                                u.Parameters.AddWithValue("@p", pid);
+                                u.ExecuteNonQuery();
+                            }
+                        }
+                        tx.Commit();
+                    }
+
+                    try { using (var g = new SQLiteCommand("DELETE FROM SyncApplyGuard", con)) g.ExecuteNonQuery(); } catch { }
+                }
+            }
+            catch
+            {
+                try
+                {
+                    using (var con = new SQLiteConnection(projectconnection.ConnectionString))
+                    {
+                        con.Open();
+                        using (var g = new SQLiteCommand("DELETE FROM SyncApplyGuard", con)) g.ExecuteNonQuery();
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>One-shot repair for every customer that has petrol rows.</summary>
+        public static void RecalculateAllCustomerPetrolBalances()
+        {
+            DataTable ids = MainClass.ExecuteSelectQuery(
+                "SELECT DISTINCT CustomerId FROM PetrolAdd WHERE CustomerId IS NOT NULL", null);
+            if (ids == null) return;
+            foreach (DataRow r in ids.Rows)
+            {
+                if (r[0] == DBNull.Value) continue;
+                RecalculateCustomerPetrolBalances(Convert.ToInt32(r[0]));
+            }
         }
 
         public static decimal GetDealerCreditBalance(int dealerId)

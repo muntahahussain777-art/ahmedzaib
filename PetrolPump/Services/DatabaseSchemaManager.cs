@@ -49,6 +49,8 @@ namespace ZaibPetroleumService.Services
                     Note TEXT
                 );");
             EnsureBulMalPermission(connection);
+            InsertPerm(connection, "Admin", "frmDealerAmountCombinedView", 1);
+            InsertPerm(connection, "Manager", "frmDealerAmountCombinedView", 1);
 
             // Sync columns for Supabase zaibservice (Mobile ↔ PC)
             string[] syncTables =
@@ -126,6 +128,7 @@ namespace ZaibPetroleumService.Services
                 "frmDashBoard","frmCustomerView","frmDiselView","frmCreditAdjust",
                 "frmCustomerToCustomerView","frmDieselLedger","frmDealerNameView",
                 "frmStockView","frmDealertoDealerView","frmDieselLedgerView",
+                "frmDealerAmountCombinedView",
                 "FrmDirectDealerPaymentAmountView","frmBankAccountView","frmExpense",
                 "frmBulMalView","frmStockDieselView","frmClosingformEntry","frmClosing2",
                 "ReportAndBackup","changepassword","ProfitLossReportForm",

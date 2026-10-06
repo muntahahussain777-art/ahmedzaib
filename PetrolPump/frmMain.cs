@@ -1,4 +1,4 @@
-﻿using ApplicationPermissions;
+using ApplicationPermissions;
 using DigiKhataApp;
 using Guna.UI2.WinForms;
 using Guna.UI2.WinForms.Enums;
@@ -347,7 +347,7 @@ namespace ZaibPetroleumService
             MapMenuButton<frmDealerNameView>(guna2Button5);
             MapMenuButton<frmStockView>(guna2Button9);
             MapMenuButton<frmDealertoDealerView>(guna2Button11);
-            MapMenuButton<frmDieselLedgerView>(guna2Button13);
+            MapMenuButton<frmDealerAmountCombinedView>(guna2Button13);
             MapMenuButton<FrmDirectDealerPaymentAmountView>(guna2Button14);
             MapMenuButton<frmStockDieselView>(btnstock);
             MapMenuButton<frmClosingformEntry>(dgvFaida);
@@ -641,7 +641,7 @@ namespace ZaibPetroleumService
 
         private void guna2Button13_Click(object sender, EventArgs e)
         {
-            AddControls(new frmDieselLedgerView());
+            AddControls(new frmDealerAmountCombinedView());
         }
 
         private void guna2Button14_Click(object sender, EventArgs e)

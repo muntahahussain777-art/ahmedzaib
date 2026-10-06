@@ -747,6 +747,12 @@
     <Compile Include="View\frmDieselLedgerView.Designer.cs">
       <DependentUpon>frmDieselLedgerView.cs</DependentUpon>
     </Compile>
+    <Compile Include="View\frmDealerAmountCombinedView.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="View\frmDealerAmountCombinedView.Designer.cs">
+      <DependentUpon>frmDealerAmountCombinedView.cs</DependentUpon>
+    </Compile>
     <Compile Include="View\FrmDirectDealerPaymentAmountView.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -1133,6 +1139,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="View\frmDieselLedgerView.resx">
       <DependentUpon>frmDieselLedgerView.cs</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="View\frmDealerAmountCombinedView.resx">
+      <DependentUpon>frmDealerAmountCombinedView.cs</DependentUpon>
     </EmbeddedResource>
     <EmbeddedResource Include="View\FrmDirectDealerPaymentAmountView.resx">
       <DependentUpon>FrmDirectDealerPaymentAmountView.cs</DependentUpon>

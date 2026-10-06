@@ -344,7 +344,7 @@
             this.guna2Button13.ShadowDecoration.Parent = this.guna2Button13;
             this.guna2Button13.Size = new System.Drawing.Size(218, 35);
             this.guna2Button13.TabIndex = 24;
-            this.guna2Button13.Text = "       Dealer Payout";
+            this.guna2Button13.Text = "       Dealer Amount";
             this.guna2Button13.TextAlign = System.Windows.Forms.HorizontalAlignment.Left;
             this.guna2Button13.Click += new System.EventHandler(this.guna2Button13_Click);
             // 
