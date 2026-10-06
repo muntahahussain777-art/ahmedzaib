@@ -11,7 +11,7 @@ using System.Windows.Forms;
 namespace ZaibPetroleumService.View
 {
     /// <summary>
-    /// One screen: Dealer Payout (credit) + Direct Dealer (debit) + running balance.
+    /// VIP Dealer Ledger: Payout + Direct + DealerAmount (AddStock litter×rate) + running balance.
     /// Add/edit/delete still use the existing save forms. No sync/pull changes.
     /// </summary>
     public partial class frmDealerAmountCombinedView : SampleView
@@ -23,6 +23,9 @@ namespace ZaibPetroleumService.View
 
         private void frmDealerAmountCombinedView_Load(object sender, EventArgs e)
         {
+            this.Text = "Dealer Ledger";
+            if (label1 != null)
+                label1.Text = "Dealer Ledger";
             dtpStart.Value = DateTime.Now;
             dtpEnd.Value = DateTime.Now;
             LoadData();
@@ -37,7 +40,7 @@ namespace ZaibPetroleumService.View
                 pick.FormBorderStyle = FormBorderStyle.FixedDialog;
                 pick.MaximizeBox = false;
                 pick.MinimizeBox = false;
-                pick.ClientSize = new Size(360, 130);
+                pick.ClientSize = new Size(520, 130);
                 pick.BackColor = Color.FromArgb(32, 36, 66);
 
                 var lbl = new Label
@@ -50,23 +53,30 @@ namespace ZaibPetroleumService.View
                 };
                 var btnPayout = new Button
                 {
-                    Text = "Dealer Payout (Credit)",
+                    Text = "Dealer Payout",
                     Size = new Size(150, 42),
                     Location = new Point(20, 55),
                     DialogResult = DialogResult.Yes
                 };
                 var btnDirect = new Button
                 {
-                    Text = "Direct Amount (Debit)",
+                    Text = "Direct Amount",
                     Size = new Size(150, 42),
                     Location = new Point(186, 55),
                     DialogResult = DialogResult.No
                 };
+                var btnStock = new Button
+                {
+                    Text = "Dealer Amount",
+                    Size = new Size(150, 42),
+                    Location = new Point(352, 55),
+                    DialogResult = DialogResult.Retry
+                };
                 pick.Controls.Add(lbl);
                 pick.Controls.Add(btnPayout);
                 pick.Controls.Add(btnDirect);
+                pick.Controls.Add(btnStock);
                 pick.AcceptButton = btnPayout;
-                pick.CancelButton = btnDirect;
 
                 DialogResult choice = pick.ShowDialog(this);
                 if (choice == DialogResult.Yes)
@@ -80,6 +90,12 @@ namespace ZaibPetroleumService.View
                     var frm = new FrmDirectDealerPaymentAmountAdd();
                     if (frm.ShowDialog() == DialogResult.OK)
                         LoadData();
+                }
+                else if (choice == DialogResult.Retry)
+                {
+                    var frm = new frmStockAdd();
+                    frm.ShowDialog();
+                    LoadData();
                 }
             }
         }
@@ -130,6 +146,9 @@ SELECT * FROM (
     'Payout' AS Kind,
     IFNULL(DL.AmounGiven, 0) AS Payout,
     0 AS Direct,
+    0 AS StockAmt,
+    0 AS Litter,
+    0 AS Rate,
     IFNULL(DL.Note, '') AS Note
   FROM DieselLedgerCredit DL
   LEFT JOIN AddDealer DA ON DL.Did = DA.Did
@@ -142,9 +161,27 @@ SELECT * FROM (
     'Direct' AS Kind,
     0 AS Payout,
     IFNULL(DL.AmounGiven, 0) AS Direct,
+    0 AS StockAmt,
+    0 AS Litter,
+    0 AS Rate,
     IFNULL(DL.Note, '') AS Note
   FROM DieselLedgerDebit DL
   LEFT JOIN AddDealer DA ON DL.Did = DA.Did
+  UNION ALL
+  SELECT
+    S.Sid AS LedgerID,
+    S.DealerId AS Did,
+    DA.DealerName AS DealerName,
+    S.Date AS Date,
+    'Dealer Amount' AS Kind,
+    0 AS Payout,
+    0 AS Direct,
+    CAST(IFNULL(S.Rate, 0) * IFNULL(S.AddDisel, 0) AS REAL) AS StockAmt,
+    IFNULL(S.AddDisel, 0) AS Litter,
+    IFNULL(S.Rate, 0) AS Rate,
+    IFNULL(S.Note, '') AS Note
+  FROM AddStock S
+  LEFT JOIN AddDealer DA ON S.DealerId = DA.Did
 ) x
 WHERE 1=1";
 
@@ -160,7 +197,7 @@ WHERE 1=1";
                         cmd.CommandText = unionCore + @"
   AND date(x.Date) >= date(@StartDate)
   AND date(x.Date) <= date(@EndDate)
-ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, x.Kind ASC, x.LedgerID ASC";
+ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, CASE x.Kind WHEN 'Dealer Amount' THEN 1 WHEN 'Direct' THEN 2 ELSE 3 END, x.LedgerID ASC";
                         cmd.Parameters.AddWithValue("@StartDate", startDate.ToString("yyyy-MM-dd"));
                         cmd.Parameters.AddWithValue("@EndDate", endDate.ToString("yyyy-MM-dd"));
                     }
@@ -171,7 +208,7 @@ ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, x.Kind ASC, 
         IFNULL(x.DealerName, '') LIKE @SearchLike
         OR IFNULL(x.Note, '') LIKE @SearchLike
       )
-ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, x.Kind ASC, x.LedgerID ASC";
+ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, CASE x.Kind WHEN 'Dealer Amount' THEN 1 WHEN 'Direct' THEN 2 ELSE 3 END, x.LedgerID ASC";
                         cmd.Parameters.AddWithValue("@SearchLike", "%" + searchText + "%");
                     }
 
@@ -202,15 +239,16 @@ ORDER BY IFNULL(x.DealerName,'' ) COLLATE NOCASE, date(x.Date) ASC, x.Kind ASC, 
             return dt;
         }
 
-        /// <summary>Opening = Direct (DD) − Payout (D) before start date. Same as dealer DDAmount − DAmount children.</summary>
+        /// <summary>Opening = (Direct + Stock litter×rate) − Payout before start date.</summary>
         private static decimal GetDealerOpeningBefore(int dealerId, DateTime beforeDate)
         {
             string query = @"
 SELECT
   IFNULL((SELECT SUM(IFNULL(AmounGiven,0)) FROM DieselLedgerDebit
           WHERE Did=@id AND date(Date) < date(@before)), 0)
--
-  IFNULL((SELECT SUM(IFNULL(AmounGiven,0)) FROM DieselLedgerCredit
++ IFNULL((SELECT SUM(IFNULL(Rate,0)*IFNULL(AddDisel,0)) FROM AddStock
+          WHERE DealerId=@id AND date(Date) < date(@before)), 0)
+- IFNULL((SELECT SUM(IFNULL(AmounGiven,0)) FROM DieselLedgerCredit
           WHERE Did=@id AND date(Date) < date(@before)), 0)";
             var ht = new Hashtable
             {
@@ -257,7 +295,9 @@ SELECT
 
                 decimal payout = ToDec(dt.Rows[i]["Payout"]);
                 decimal direct = ToDec(dt.Rows[i]["Direct"]);
+                decimal stockAmt = dt.Columns.Contains("StockAmt") ? ToDec(dt.Rows[i]["StockAmt"]) : 0m;
                 run += direct;
+                run += stockAmt;
                 run -= payout;
                 dt.Rows[i]["Balance"] = run;
             }
@@ -282,7 +322,7 @@ SELECT
                     if (!guna2DataGridView1.Columns.Contains(gridCol)) return;
                     var col = guna2DataGridView1.Columns[gridCol];
                     col.DataPropertyName = dt.Columns.Contains(dataCol) ? dataCol : string.Empty;
-                    col.Visible = gridCol != "dgvid" && gridCol != "dgvDid" && gridCol != "dgvKind";
+                    col.Visible = gridCol != "dgvid" && gridCol != "dgvDid";
                 }
 
                 Map("dgvid", "LedgerID");
@@ -290,6 +330,9 @@ SELECT
                 Map("dgvKind", "Kind");
                 Map("dgvName", "DealerName");
                 Map("dgvDate", "Date");
+                Map("dgvLitter", "Litter");
+                Map("dgvRate", "Rate");
+                Map("dgvStock", "StockAmt");
                 Map("dgvPayout", "Payout");
                 Map("dgvDirect", "Direct");
                 Map("dgvBalance", "Balance");
@@ -307,18 +350,19 @@ SELECT
 
         private void UpdateSummary(DataTable dt)
         {
-            decimal payout = 0m, direct = 0m;
+            decimal payout = 0m, direct = 0m, stock = 0m;
             if (dt != null)
             {
                 foreach (DataRow r in dt.Rows)
                 {
                     payout += ToDec(r["Payout"]);
                     direct += ToDec(r["Direct"]);
+                    stock += dt.Columns.Contains("StockAmt") ? ToDec(r["StockAmt"]) : 0m;
                 }
             }
             lblPayout.Text = $"Payout: {payout:N2}";
-            lblDirect.Text = $"Direct: {direct:N2}";
-            lblResult.Text = $"Period net (Direct − Payout): {(direct - payout):N2}   |   Balance column = running";
+            lblDirect.Text = $"Direct: {direct:N2}   |   Amount: {stock:N2}";
+            lblResult.Text = $"Period net (Direct+Amount − Payout): {(direct + stock - payout):N2}   |   Balance = running";
         }
 
         private void guna2DataGridView1_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
@@ -352,6 +396,13 @@ SELECT
                 var frm = new FrmDirectDealerPaymentAmountAdd(id);
                 if (frm.ShowDialog() == DialogResult.OK)
                     LoadData();
+            }
+            else if (string.Equals(kind, "Dealer Amount", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(kind, "Stock", StringComparison.OrdinalIgnoreCase))
+            {
+                var frm = new frmStockAdd { id = id };
+                frm.ShowDialog();
+                LoadData();
             }
             else
             {

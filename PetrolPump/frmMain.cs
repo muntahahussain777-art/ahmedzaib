@@ -347,8 +347,8 @@ namespace ZaibPetroleumService
             MapMenuButton<frmDealerNameView>(guna2Button5);
             MapMenuButton<frmStockView>(guna2Button9);
             MapMenuButton<frmDealertoDealerView>(guna2Button11);
-            MapMenuButton<frmDealerAmountCombinedView>(guna2Button13);
-            MapMenuButton<FrmDirectDealerPaymentAmountView>(guna2Button14);
+            MapMenuButton<frmDieselLedgerView>(guna2Button13);
+            MapMenuButton<frmDealerAmountCombinedView>(guna2Button14);
             MapMenuButton<frmStockDieselView>(btnstock);
             MapMenuButton<frmClosingformEntry>(dgvFaida);
             MapMenuButton<frmClosing2>(btnClosing2);
@@ -641,12 +641,12 @@ namespace ZaibPetroleumService
 
         private void guna2Button13_Click(object sender, EventArgs e)
         {
-            AddControls(new frmDealerAmountCombinedView());
+            AddControls(new frmDieselLedgerView());
         }
 
         private void guna2Button14_Click(object sender, EventArgs e)
         {
-            AddControls(new FrmDirectDealerPaymentAmountView());
+            AddControls(new frmDealerAmountCombinedView());
         }
 
         private void guna2Button15_Click(object sender, EventArgs e)

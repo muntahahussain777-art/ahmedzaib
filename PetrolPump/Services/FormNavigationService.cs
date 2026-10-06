@@ -297,9 +297,9 @@ namespace ZaibPetroleumService.Services
 Ctrl+D=frmDiselView|Daily Diesel Sales
 Ctrl+C=frmCreditAdjust|Credit Customer
 Ctrl+A=frmDealerNameView|Add Dealer
-Ctrl+P=frmDealerAmountCombinedView|Dealer Amount
+Ctrl+P=frmDieselLedgerView|Dealer Payout
 Ctrl+M=frmStockView|DealerAmount
-Ctrl+I=FrmDirectDealerPaymentAmountView|Direct Dealer Amount
+Ctrl+I=frmDealerAmountCombinedView|Dealer Ledger
 Ctrl+U=frmCustomerView|Add Customer
 Ctrl+T=frmCustomerToCustomerView|Customer To Customer
 Ctrl+L=frmDieselLedger|Customer To Dealer

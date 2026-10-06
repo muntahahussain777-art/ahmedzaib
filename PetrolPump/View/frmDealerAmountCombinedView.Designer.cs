@@ -30,6 +30,9 @@ namespace ZaibPetroleumService.View
             this.dgvKind = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvName = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvDate = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dgvLitter = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dgvRate = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dgvStock = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvPayout = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvDirect = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dgvBalance = new System.Windows.Forms.DataGridViewTextBoxColumn();
@@ -69,6 +72,10 @@ namespace ZaibPetroleumService.View
             this.panel1.Controls.SetChildIndex(this.dtpEnd, 0);
             this.panel1.Controls.SetChildIndex(this.lblPayout, 0);
             this.panel1.Controls.SetChildIndex(this.lblDirect, 0);
+            //
+            // label1
+            //
+            this.label1.Text = "Dealer Ledger";
             //
             // btnAdd
             //
@@ -142,9 +149,9 @@ namespace ZaibPetroleumService.View
             this.lblDirect.ForeColor = System.Drawing.Color.White;
             this.lblDirect.Location = new System.Drawing.Point(540, 81);
             this.lblDirect.Name = "lblDirect";
-            this.lblDirect.Size = new System.Drawing.Size(280, 30);
+            this.lblDirect.Size = new System.Drawing.Size(460, 30);
             this.lblDirect.TabIndex = 13;
-            this.lblDirect.Text = "Direct: 0.00";
+            this.lblDirect.Text = "Direct: 0.00   |   Amount: 0.00";
             //
             // guna2DataGridView1
             //
@@ -176,6 +183,9 @@ namespace ZaibPetroleumService.View
             this.dgvKind,
             this.dgvName,
             this.dgvDate,
+            this.dgvLitter,
+            this.dgvRate,
+            this.dgvStock,
             this.dgvPayout,
             this.dgvDirect,
             this.dgvBalance,
@@ -253,10 +263,10 @@ namespace ZaibPetroleumService.View
             //
             // dgvKind
             //
-            this.dgvKind.HeaderText = "Kind";
+            this.dgvKind.HeaderText = "Type";
             this.dgvKind.Name = "dgvKind";
             this.dgvKind.ReadOnly = true;
-            this.dgvKind.Visible = false;
+            this.dgvKind.Width = 120;
             //
             // dgvName
             //
@@ -269,6 +279,27 @@ namespace ZaibPetroleumService.View
             this.dgvDate.HeaderText = "Date";
             this.dgvDate.Name = "dgvDate";
             this.dgvDate.ReadOnly = true;
+            //
+            // dgvLitter
+            //
+            this.dgvLitter.HeaderText = "Litter";
+            this.dgvLitter.Name = "dgvLitter";
+            this.dgvLitter.ReadOnly = true;
+            this.dgvLitter.DefaultCellStyle.Format = "N2";
+            //
+            // dgvRate
+            //
+            this.dgvRate.HeaderText = "Rate";
+            this.dgvRate.Name = "dgvRate";
+            this.dgvRate.ReadOnly = true;
+            this.dgvRate.DefaultCellStyle.Format = "N2";
+            //
+            // dgvStock
+            //
+            this.dgvStock.HeaderText = "Amount";
+            this.dgvStock.Name = "dgvStock";
+            this.dgvStock.ReadOnly = true;
+            this.dgvStock.DefaultCellStyle.Format = "N2";
             //
             // dgvPayout
             //
@@ -311,7 +342,7 @@ namespace ZaibPetroleumService.View
             this.ClientSize = new System.Drawing.Size(1217, 533);
             this.Controls.Add(this.guna2DataGridView1);
             this.Name = "frmDealerAmountCombinedView";
-            this.Text = "Dealer Amount";
+            this.Text = "Dealer Ledger";
             this.Load += new System.EventHandler(this.frmDealerAmountCombinedView_Load);
             this.Controls.SetChildIndex(this.panel1, 0);
             this.Controls.SetChildIndex(this.guna2DataGridView1, 0);
@@ -335,6 +366,9 @@ namespace ZaibPetroleumService.View
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvKind;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvName;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvDate;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dgvLitter;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dgvRate;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dgvStock;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvPayout;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvDirect;
         private System.Windows.Forms.DataGridViewTextBoxColumn dgvBalance;
